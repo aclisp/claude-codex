@@ -13,7 +13,7 @@ export interface AnthropicMessageResponse {
     usage: AnthropicUsage;
 }
 
-export type AnthropicResponseContentBlock = AnthropicTextResponseBlock | AnthropicToolUseResponseBlock;
+export type AnthropicResponseContentBlock = AnthropicTextResponseBlock | AnthropicThinkingResponseBlock | AnthropicToolUseResponseBlock;
 
 export interface AnthropicTextResponseBlock {
     type: 'text';
@@ -25,6 +25,12 @@ export interface AnthropicToolUseResponseBlock {
     id: string;
     name: string;
     input: Record<string, unknown>;
+}
+
+export interface AnthropicThinkingResponseBlock {
+    type: 'thinking';
+    thinking: string;
+    signature: string;
 }
 
 export function collectAnthropicMessage(events: Iterable<InternalAssistantEvent>): AnthropicMessageResponse {
@@ -54,6 +60,22 @@ export function collectAnthropicMessage(events: Iterable<InternalAssistantEvent>
                 type: 'text',
                 text: '',
             });
+        } else if (event.type === 'thinking_start') {
+            setContentBlock(content, event.index, {
+                type: 'thinking',
+                thinking: '',
+                signature: '',
+            });
+        } else if (event.type === 'thinking_delta') {
+            const block = expectThinkingBlock(content, event.index);
+            block.thinking += event.delta;
+        } else if (event.type === 'thinking_signature_delta') {
+            const block = expectThinkingBlock(content, event.index);
+            block.signature += event.signature;
+        } else if (event.type === 'thinking_end') {
+            const block = expectThinkingBlock(content, event.index);
+            block.thinking = event.thinking;
+            block.signature = event.signature;
         } else if (event.type === 'text_delta') {
             const block = expectTextBlock(content, event.index);
             block.text += event.delta;
@@ -107,6 +129,14 @@ function expectTextBlock(content: AnthropicResponseContentBlock[], index: number
     const block = content[index];
     if (block?.type !== 'text') {
         throw new ProxyValidationError(`Expected text content block at index ${index}.`);
+    }
+    return block;
+}
+
+function expectThinkingBlock(content: AnthropicResponseContentBlock[], index: number): AnthropicThinkingResponseBlock {
+    const block = content[index];
+    if (block?.type !== 'thinking') {
+        throw new ProxyValidationError(`Expected thinking content block at index ${index}.`);
     }
     return block;
 }

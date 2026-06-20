@@ -40,6 +40,50 @@ export function toAnthropicSseFrames(events: Iterable<InternalAssistantEvent>): 
                     },
                 },
             });
+        } else if (event.type === 'thinking_start') {
+            frames.push({
+                event: 'content_block_start',
+                data: {
+                    type: 'content_block_start',
+                    index: event.index,
+                    content_block: {
+                        type: 'thinking',
+                        thinking: '',
+                    },
+                },
+            });
+        } else if (event.type === 'thinking_delta') {
+            frames.push({
+                event: 'content_block_delta',
+                data: {
+                    type: 'content_block_delta',
+                    index: event.index,
+                    delta: {
+                        type: 'thinking_delta',
+                        thinking: event.delta,
+                    },
+                },
+            });
+        } else if (event.type === 'thinking_signature_delta') {
+            frames.push({
+                event: 'content_block_delta',
+                data: {
+                    type: 'content_block_delta',
+                    index: event.index,
+                    delta: {
+                        type: 'signature_delta',
+                        signature: event.signature,
+                    },
+                },
+            });
+        } else if (event.type === 'thinking_end') {
+            frames.push({
+                event: 'content_block_stop',
+                data: {
+                    type: 'content_block_stop',
+                    index: event.index,
+                },
+            });
         } else if (event.type === 'text_delta') {
             frames.push({
                 event: 'content_block_delta',

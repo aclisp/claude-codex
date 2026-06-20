@@ -1,7 +1,8 @@
-import type { Response, ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
+import type { Response, ResponseOutputItem, ResponseReasoningItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
 import { ProxyError } from '../protocol/errors.ts';
 import type { InternalAssistantEvent, InternalMessageEndEvent } from '../protocol/events.ts';
 import type { InternalUsage } from '../protocol/usage.ts';
+import { encodeReasoningSignature } from '../reasoning/signature.ts';
 import { createMessageId, shortHash } from '../runtime/id.ts';
 import { encodeToolId } from '../tools/tool-id.ts';
 
@@ -58,7 +59,19 @@ interface ToolBlockState {
     ended: boolean;
 }
 
-type BlockState = TextBlockState | ToolBlockState;
+interface ThinkingBlockState {
+    kind: 'thinking';
+    index: number;
+    itemId: string;
+    thinking: string;
+    segments: Map<string, string>;
+    signature: string;
+    item?: ResponseReasoningItem;
+    started: boolean;
+    ended: boolean;
+}
+
+type BlockState = TextBlockState | ThinkingBlockState | ToolBlockState;
 
 export async function* mapRawCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
     for await (const event of events) {
@@ -166,6 +179,32 @@ export async function* processCodexStream(
         return block;
     };
 
+    const ensureThinkingBlock = (outputIndex: number, item: Pick<ResponseReasoningItem, 'id'> & Partial<ResponseReasoningItem>): ThinkingBlockState => {
+        const existing = blocksByOutputIndex.get(outputIndex);
+        if (existing?.kind === 'thinking') {
+            if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+                existing.item = item as ResponseReasoningItem;
+            }
+            return existing;
+        }
+
+        const block: ThinkingBlockState = {
+            kind: 'thinking',
+            index: nextContentIndex,
+            itemId: item.id,
+            thinking: '',
+            segments: new Map(),
+            signature: '',
+            item: item.type === 'reasoning' && Array.isArray(item.summary) ? (item as ResponseReasoningItem) : undefined,
+            started: false,
+            ended: false,
+        };
+        nextContentIndex += 1;
+        blocksByOutputIndex.set(outputIndex, block);
+        blocksByItemId.set(item.id, block);
+        return block;
+    };
+
     const startBlockEvents = function* (block: BlockState): Generator<InternalAssistantEvent> {
         const start = createStart();
         if (start) {
@@ -180,6 +219,14 @@ export async function* processCodexStream(
         if (block.kind === 'text') {
             yield {
                 type: 'text_start',
+                index: block.index,
+            };
+            return;
+        }
+
+        if (block.kind === 'thinking') {
+            yield {
+                type: 'thinking_start',
                 index: block.index,
             };
             return;
@@ -211,6 +258,11 @@ export async function* processCodexStream(
                 for (const startEvent of startBlockEvents(block)) {
                     yield startEvent;
                 }
+            } else if (item.type === 'reasoning') {
+                const block = ensureThinkingBlock(event.output_index, item);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
             } else if (item.type === 'function_call') {
                 const block = ensureToolBlock(event.output_index, item);
                 for (const startEvent of startBlockEvents(block)) {
@@ -224,6 +276,50 @@ export async function* processCodexStream(
                     };
                 }
             }
+            continue;
+        }
+
+        if (event.type === 'response.reasoning_summary_text.delta' || event.type === 'response.reasoning_text.delta') {
+            const segmentKey = getReasoningSegmentKey(event);
+            const block = ensureThinkingBlock(event.output_index, {
+                id: event.item_id,
+                type: 'reasoning',
+                summary: [],
+            });
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            block.segments.set(segmentKey, `${block.segments.get(segmentKey) ?? ''}${event.delta}`);
+            block.thinking += event.delta;
+            yield {
+                type: 'thinking_delta',
+                index: block.index,
+                delta: event.delta,
+            };
+            continue;
+        }
+
+        if (event.type === 'response.reasoning_summary_text.done' || event.type === 'response.reasoning_text.done') {
+            const segmentKey = getReasoningSegmentKey(event);
+            const block = ensureThinkingBlock(event.output_index, {
+                id: event.item_id,
+                type: 'reasoning',
+                summary: [],
+            });
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            const previousSegment = block.segments.get(segmentKey) ?? '';
+            const delta = missingSuffix(previousSegment, event.text);
+            if (delta.length > 0) {
+                yield {
+                    type: 'thinking_delta',
+                    index: block.index,
+                    delta,
+                };
+            }
+            block.segments.set(segmentKey, event.text);
+            block.thinking = mergeReasoningSegments(block.segments);
             continue;
         }
 
@@ -308,6 +404,39 @@ export async function* processCodexStream(
                         type: 'text_end',
                         index: block.index,
                         text: block.text,
+                    };
+                }
+            } else if (event.item.type === 'reasoning') {
+                const block = ensureThinkingBlock(event.output_index, event.item);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
+                const thinking = extractReasoningText(event.item, block.thinking);
+                const delta = missingSuffix(block.thinking, thinking);
+                if (delta.length > 0) {
+                    block.thinking += delta;
+                    yield {
+                        type: 'thinking_delta',
+                        index: block.index,
+                        delta,
+                    };
+                } else {
+                    block.thinking = thinking;
+                }
+                block.item = event.item;
+                block.signature = encodeReasoningSignature(event.item);
+                if (!block.ended) {
+                    block.ended = true;
+                    yield {
+                        type: 'thinking_signature_delta',
+                        index: block.index,
+                        signature: block.signature,
+                    };
+                    yield {
+                        type: 'thinking_end',
+                        index: block.index,
+                        thinking: block.thinking,
+                        signature: block.signature,
                     };
                 }
             } else if (event.item.type === 'function_call') {
@@ -398,6 +527,20 @@ function* closeOpenBlocks(blocks: Map<number, BlockState>): Generator<InternalAs
                 index: block.index,
                 text: block.text,
             };
+        } else if (block.kind === 'thinking') {
+            const item = block.item ?? createSyntheticReasoningItem(block);
+            block.signature = encodeReasoningSignature(item);
+            yield {
+                type: 'thinking_signature_delta',
+                index: block.index,
+                signature: block.signature,
+            };
+            yield {
+                type: 'thinking_end',
+                index: block.index,
+                thinking: block.thinking,
+                signature: block.signature,
+            };
         } else {
             yield {
                 type: 'tool_end',
@@ -420,6 +563,66 @@ function parseToolInput(value: string): Record<string, unknown> {
         // Fall through to protocol error below.
     }
     throw new CodexProtocolError('Codex emitted malformed function-call JSON arguments.', { payload: value });
+}
+
+function extractReasoningText(item: ResponseReasoningItem, fallback: string): string {
+    const summaryText = item.summary.map((part) => part.text).join('');
+    if (summaryText.length > 0) {
+        return summaryText;
+    }
+
+    const contentText = item.content?.map((part) => part.text).join('') ?? '';
+    if (contentText.length > 0) {
+        return contentText;
+    }
+
+    return fallback;
+}
+
+function missingSuffix(current: string, finalText: string): string {
+    if (finalText.length === 0 || current === finalText) {
+        return '';
+    }
+    if (finalText.startsWith(current)) {
+        return finalText.slice(current.length);
+    }
+    return current.length === 0 ? finalText : '';
+}
+
+function getReasoningSegmentKey(
+    event:
+        | { type: 'response.reasoning_summary_text.delta' | 'response.reasoning_summary_text.done'; summary_index: number }
+        | { type: 'response.reasoning_text.delta' | 'response.reasoning_text.done'; content_index: number },
+): string {
+    if ('summary_index' in event) {
+        return `summary:${event.summary_index}`;
+    }
+    return `content:${event.content_index}`;
+}
+
+function mergeReasoningSegments(segments: Map<string, string>): string {
+    return [...segments.entries()]
+        .sort(([left], [right]) => compareSegmentKeys(left, right))
+        .map(([, text]) => text)
+        .join('');
+}
+
+function compareSegmentKeys(left: string, right: string): number {
+    const [leftKind, leftIndex = '0'] = left.split(':', 2);
+    const [rightKind, rightIndex = '0'] = right.split(':', 2);
+    if (leftKind !== rightKind) {
+        return leftKind === 'summary' ? -1 : 1;
+    }
+    return Number(leftIndex) - Number(rightIndex);
+}
+
+function createSyntheticReasoningItem(block: ThinkingBlockState): ResponseReasoningItem {
+    return {
+        id: block.itemId,
+        type: 'reasoning',
+        summary: block.thinking.length > 0 ? [{ type: 'summary_text', text: block.thinking }] : [],
+        status: 'completed',
+    };
 }
 
 function mapUsage(response: Response): InternalUsage | undefined {

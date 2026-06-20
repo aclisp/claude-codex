@@ -3,6 +3,10 @@ import type { InternalUsage } from './usage.ts';
 
 export type InternalAssistantEvent =
     | InternalMessageStartEvent
+    | InternalThinkingStartEvent
+    | InternalThinkingDeltaEvent
+    | InternalThinkingSignatureDeltaEvent
+    | InternalThinkingEndEvent
     | InternalTextStartEvent
     | InternalTextDeltaEvent
     | InternalTextEndEvent
@@ -23,6 +27,30 @@ export interface InternalMessageStartEvent {
 export interface InternalTextStartEvent {
     type: 'text_start';
     index: number;
+}
+
+export interface InternalThinkingStartEvent {
+    type: 'thinking_start';
+    index: number;
+}
+
+export interface InternalThinkingDeltaEvent {
+    type: 'thinking_delta';
+    index: number;
+    delta: string;
+}
+
+export interface InternalThinkingSignatureDeltaEvent {
+    type: 'thinking_signature_delta';
+    index: number;
+    signature: string;
+}
+
+export interface InternalThinkingEndEvent {
+    type: 'thinking_end';
+    index: number;
+    thinking: string;
+    signature: string;
 }
 
 export interface InternalTextDeltaEvent {

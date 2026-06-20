@@ -2,8 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import { collectAnthropicMessage } from './anthropic/response.ts';
 import { encodeAnthropicSse, toAnthropicSseFrames } from './anthropic/sse.ts';
 import { translateAnthropicToCodex } from './codex/request.ts';
+import { redactBody } from './http/server.ts';
 import { ProxyValidationError } from './protocol/errors.ts';
 import type { InternalAssistantEvent } from './protocol/events.ts';
+import { encodeReasoningSignature } from './reasoning/signature.ts';
 import { encodeToolId } from './tools/tool-id.ts';
 
 describe('Anthropic to Codex request translation', () => {
@@ -140,6 +142,68 @@ describe('Anthropic to Codex request translation', () => {
                 arguments: JSON.stringify({ path: '/tmp/a' }),
             },
         ]);
+    });
+
+    test('replays assistant thinking blocks using proxy reasoning signatures', () => {
+        const reasoningItem = {
+            type: 'reasoning' as const,
+            id: 'rs_123',
+            summary: [{ type: 'summary_text' as const, text: 'Inspected the state.' }],
+            encrypted_content: 'encrypted-reasoning',
+            status: 'completed' as const,
+        };
+        const signature = encodeReasoningSignature(reasoningItem);
+
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            messages: [
+                {
+                    role: 'assistant',
+                    content: [
+                        { type: 'thinking', thinking: 'Inspected the state.', signature },
+                        { type: 'text', text: 'Done.' },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.input).toEqual([
+            reasoningItem,
+            {
+                type: 'message',
+                role: 'assistant',
+                id: 'msg_ccx_replay_0_1',
+                status: 'completed',
+                content: [{ type: 'output_text', text: 'Done.', annotations: [] }],
+            },
+        ]);
+    });
+
+    test('replays proxy-owned redacted thinking data and rejects unknown reasoning signatures', () => {
+        const reasoningItem = {
+            type: 'reasoning' as const,
+            id: 'rs_redacted',
+            summary: [],
+            encrypted_content: 'encrypted-only',
+        };
+        const signature = encodeReasoningSignature(reasoningItem);
+
+        expect(
+            translateAnthropicToCodex({
+                model: 'gpt-5.4-mini',
+                max_tokens: 128,
+                messages: [{ role: 'assistant', content: [{ type: 'redacted_thinking', data: signature }] }],
+            }).input,
+        ).toEqual([reasoningItem]);
+
+        expect(() =>
+            translateAnthropicToCodex({
+                model: 'gpt-5.4-mini',
+                max_tokens: 128,
+                messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'external', signature: 'not_proxy_owned' }] }],
+            }),
+        ).toThrow(ProxyValidationError);
     });
 
     test('maps tool results back to function_call_output items', () => {
@@ -303,6 +367,74 @@ describe('Anthropic response encoding', () => {
                 output_tokens: 5,
                 cache_read_input_tokens: 1,
             },
+        });
+    });
+
+    test('encodes internal thinking events to Anthropic SSE and non-streaming message JSON', () => {
+        const signature = encodeReasoningSignature({
+            type: 'reasoning',
+            id: 'rs_789',
+            summary: [{ type: 'summary_text', text: 'Checked the files.' }],
+            encrypted_content: 'encrypted',
+        });
+        const events: InternalAssistantEvent[] = [
+            { type: 'message_start', messageId: 'msg_ccx_3', model: 'gpt-5.4-mini', createdAt: 3 },
+            { type: 'thinking_start', index: 0 },
+            { type: 'thinking_delta', index: 0, delta: 'Checked ' },
+            { type: 'thinking_delta', index: 0, delta: 'the files.' },
+            { type: 'thinking_signature_delta', index: 0, signature },
+            { type: 'thinking_end', index: 0, thinking: 'Checked the files.', signature },
+            { type: 'text_start', index: 1 },
+            { type: 'text_delta', index: 1, delta: 'Done.' },
+            { type: 'text_end', index: 1, text: 'Done.' },
+            { type: 'message_end', stopReason: 'end_turn' },
+        ];
+
+        const frames = toAnthropicSseFrames(events);
+        expect(frames).toContainEqual({
+            event: 'content_block_delta',
+            data: {
+                type: 'content_block_delta',
+                index: 0,
+                delta: {
+                    type: 'thinking_delta',
+                    thinking: 'Checked ',
+                },
+            },
+        });
+        expect(frames).toContainEqual({
+            event: 'content_block_delta',
+            data: {
+                type: 'content_block_delta',
+                index: 0,
+                delta: {
+                    type: 'signature_delta',
+                    signature,
+                },
+            },
+        });
+
+        expect(collectAnthropicMessage(events).content).toEqual([
+            { type: 'thinking', thinking: 'Checked the files.', signature },
+            { type: 'text', text: 'Done.' },
+        ]);
+    });
+
+    test('redacts reasoning payload fields from debug body traces', () => {
+        expect(
+            redactBody({
+                signature: 'sig',
+                thinking: 'chain',
+                data: 'opaque',
+                encrypted_content: 'encrypted',
+                nested: { access_token: 'token', text: 'visible' },
+            }),
+        ).toEqual({
+            signature: '[redacted]',
+            thinking: '[redacted]',
+            data: '[redacted]',
+            encrypted_content: '[redacted]',
+            nested: { access_token: '[redacted]', text: 'visible' },
         });
     });
 });

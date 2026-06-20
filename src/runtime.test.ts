@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { ResponseReasoningItem } from 'openai/resources/responses/responses.js';
 import { collectAnthropicMessage } from './anthropic/response.ts';
+import { toAnthropicSseFrames } from './anthropic/sse.ts';
 import { CodexAuthReader } from './codex/auth.ts';
 import { CodexClient } from './codex/client.ts';
 import { buildCodexRequest } from './codex/request.ts';
 import { mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
 import { createProxyServer } from './http/server.ts';
+import { decodeReasoningSignature } from './reasoning/signature.ts';
 import { loadRuntimeConfig } from './runtime/config.ts';
 import { createSessionStore } from './sessions/store.ts';
 
@@ -125,6 +128,130 @@ describe('Codex stream processing', () => {
             input: { path: '/tmp/a' },
         });
         expect((message.content[0] as { id: string }).id.startsWith('ccx_')).toBe(true);
+    });
+
+    test('maps Codex reasoning summaries to Anthropic thinking blocks', async () => {
+        const reasoningItem: ResponseReasoningItem = {
+            type: 'reasoning',
+            id: 'rs_1',
+            status: 'completed',
+            summary: [{ type: 'summary_text', text: 'Looked at the request.' }],
+            encrypted_content: 'encrypted-reasoning',
+        };
+        const events = await collectAsync(
+            processCodexStream(
+                mapRawCodexEvents(
+                    asyncIterable([
+                        { type: 'response.created', response: { id: 'resp_3' } },
+                        {
+                            type: 'response.output_item.added',
+                            output_index: 0,
+                            item: { type: 'reasoning', id: 'rs_1', status: 'in_progress', summary: [] },
+                        },
+                        {
+                            type: 'response.reasoning_summary_text.delta',
+                            output_index: 0,
+                            item_id: 'rs_1',
+                            summary_index: 0,
+                            delta: 'Looked at ',
+                            sequence_number: 1,
+                        },
+                        {
+                            type: 'response.reasoning_summary_text.done',
+                            output_index: 0,
+                            item_id: 'rs_1',
+                            summary_index: 0,
+                            text: 'Looked at the request.',
+                            sequence_number: 2,
+                        },
+                        {
+                            type: 'response.output_item.done',
+                            output_index: 0,
+                            item: reasoningItem,
+                        },
+                        {
+                            type: 'response.output_item.added',
+                            output_index: 1,
+                            item: { type: 'message', id: 'msg_3', role: 'assistant', status: 'in_progress', content: [] },
+                        },
+                        { type: 'response.output_text.delta', output_index: 1, item_id: 'msg_3', content_index: 0, delta: 'Ready.' },
+                        {
+                            type: 'response.output_item.done',
+                            output_index: 1,
+                            item: {
+                                type: 'message',
+                                id: 'msg_3',
+                                role: 'assistant',
+                                status: 'completed',
+                                content: [{ type: 'output_text', text: 'Ready.', annotations: [] }],
+                            },
+                        },
+                        { type: 'response.completed', response: { id: 'resp_3', status: 'completed', output: [] } },
+                    ]),
+                ),
+                { model: 'gpt-5.4-mini', messageId: 'msg_ccx_thinking', createdAt: 1 },
+            ),
+        );
+
+        expect(events.map((event) => event.type)).toEqual([
+            'message_start',
+            'thinking_start',
+            'thinking_delta',
+            'thinking_delta',
+            'thinking_signature_delta',
+            'thinking_end',
+            'text_start',
+            'text_delta',
+            'text_end',
+            'message_end',
+        ]);
+
+        const message = collectAnthropicMessage(events);
+        const thinking = message.content[0] as { type: 'thinking'; thinking: string; signature: string };
+        expect(thinking).toMatchObject({
+            type: 'thinking',
+            thinking: 'Looked at the request.',
+        });
+        expect(decodeReasoningSignature(thinking.signature)).toEqual(reasoningItem);
+        expect(message.content[1]).toEqual({ type: 'text', text: 'Ready.' });
+    });
+
+    test('maps encrypted-only Codex reasoning to omitted Anthropic thinking', async () => {
+        const reasoningItem: ResponseReasoningItem = {
+            type: 'reasoning',
+            id: 'rs_encrypted',
+            status: 'completed',
+            summary: [],
+            encrypted_content: 'encrypted-only',
+        };
+        const events = await collectAsync(
+            processCodexStream(
+                mapRawCodexEvents(
+                    asyncIterable([
+                        { type: 'response.created', response: { id: 'resp_4' } },
+                        {
+                            type: 'response.output_item.added',
+                            output_index: 0,
+                            item: { type: 'reasoning', id: 'rs_encrypted', status: 'in_progress', summary: [] },
+                        },
+                        {
+                            type: 'response.output_item.done',
+                            output_index: 0,
+                            item: reasoningItem,
+                        },
+                        { type: 'response.completed', response: { id: 'resp_4', status: 'completed', output: [] } },
+                    ]),
+                ),
+                { model: 'gpt-5.4-mini', messageId: 'msg_ccx_omitted', createdAt: 1 },
+            ),
+        );
+
+        expect(events.map((event) => event.type)).toEqual(['message_start', 'thinking_start', 'thinking_signature_delta', 'thinking_end', 'message_end']);
+        const message = collectAnthropicMessage(events);
+        const thinking = message.content[0] as { type: 'thinking'; thinking: string; signature: string };
+        expect(thinking.thinking).toBe('');
+        expect(decodeReasoningSignature(thinking.signature)).toEqual(reasoningItem);
+        expect(toAnthropicSseFrames(events).filter((frame) => JSON.stringify(frame.data).includes('thinking_delta'))).toHaveLength(0);
     });
 });
 

@@ -290,7 +290,7 @@ async function traceDebugBody(config: ProxyRuntimeConfig, rawBody: unknown): Pro
     );
 }
 
-function redactBody(value: unknown): unknown {
+export function redactBody(value: unknown): unknown {
     if (Array.isArray(value)) {
         return value.map(redactBody);
     }
@@ -299,7 +299,7 @@ function redactBody(value: unknown): unknown {
     }
     const result: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
-        if (/token|authorization|api[_-]?key|secret|password/i.test(key)) {
+        if (/token|authorization|api[_-]?key|secret|password|signature|encrypted[_-]?content|thinking|data/i.test(key)) {
             result[key] = '[redacted]';
         } else {
             result[key] = redactBody(item);

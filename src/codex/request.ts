@@ -1,4 +1,4 @@
-import type { Tool as OpenAIResponseTool, ResponseCreateParamsStreaming, ResponseInput } from 'openai/resources/responses/responses.js';
+import type { Tool as OpenAIResponseTool, ResponseCreateParamsStreaming, ResponseInput, ResponseReasoningItem } from 'openai/resources/responses/responses.js';
 import type {
     AnthropicAssistantContentBlock,
     AnthropicMessageRequest,
@@ -9,6 +9,7 @@ import type {
 } from '../anthropic/request.ts';
 import { parseAnthropicRequest } from '../anthropic/request.ts';
 import { ProxyValidationError } from '../protocol/errors.ts';
+import { decodeReasoningSignature } from '../reasoning/signature.ts';
 import { decodeToolId } from '../tools/tool-id.ts';
 import { type CodexModelId, DEFAULT_CODEX_MODEL_ID, validateCodexModelId } from './models.ts';
 
@@ -88,7 +89,7 @@ interface CodexFunctionCallOutputItem {
     output: string;
 }
 
-type CodexInputItem = CodexInputMessage | CodexAssistantMessageItem | CodexFunctionCallItem | CodexFunctionCallOutputItem;
+type CodexInputItem = CodexInputMessage | CodexAssistantMessageItem | CodexFunctionCallItem | CodexFunctionCallOutputItem | ResponseReasoningItem;
 
 export function translateAnthropicToCodex(input: unknown, options?: BuildCodexRequestOptions): CodexResponsesRequest {
     return buildCodexRequest(parseAnthropicRequest(input), options);
@@ -231,6 +232,12 @@ function translateAssistantMessage(content: AnthropicMessageRequest['messages'][
     return (content as AnthropicAssistantContentBlock[]).map((block, blockIndex) => {
         if (block.type === 'text') {
             return createAssistantTextItem(block.text, messageIndex, blockIndex);
+        }
+        if (block.type === 'thinking') {
+            return decodeReasoningSignature(block.signature);
+        }
+        if (block.type === 'redacted_thinking') {
+            return decodeReasoningSignature(block.data);
         }
 
         return translateToolUse(block);

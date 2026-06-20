@@ -27,7 +27,7 @@ export interface AnthropicMessage {
 export type AnthropicMessageContent = string | AnthropicUserContentBlock[] | AnthropicAssistantContentBlock[];
 
 export type AnthropicUserContentBlock = AnthropicTextBlock | AnthropicImageBlock | AnthropicToolResultBlock;
-export type AnthropicAssistantContentBlock = AnthropicTextBlock | AnthropicToolUseBlock;
+export type AnthropicAssistantContentBlock = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinkingBlock | AnthropicToolUseBlock;
 
 export interface AnthropicTextBlock {
     type: 'text';
@@ -48,6 +48,17 @@ export interface AnthropicToolUseBlock {
     id: string;
     name: string;
     input: Record<string, unknown>;
+}
+
+export interface AnthropicThinkingBlock {
+    type: 'thinking';
+    thinking: string;
+    signature: string;
+}
+
+export interface AnthropicRedactedThinkingBlock {
+    type: 'redacted_thinking';
+    data: string;
 }
 
 export interface AnthropicToolResultBlock {
@@ -267,6 +278,21 @@ function parseAssistantContentBlock(value: unknown, messageIndex: number, blockI
             id: expectString(raw.id, `messages[${messageIndex}].content[${blockIndex}].id`),
             name: expectString(raw.name, `messages[${messageIndex}].content[${blockIndex}].name`),
             input: expectRecord(raw.input, `messages[${messageIndex}].content[${blockIndex}].input`),
+        };
+    }
+
+    if (type === 'thinking') {
+        return {
+            type: 'thinking',
+            thinking: expectString(raw.thinking, `messages[${messageIndex}].content[${blockIndex}].thinking`),
+            signature: expectString(raw.signature, `messages[${messageIndex}].content[${blockIndex}].signature`),
+        };
+    }
+
+    if (type === 'redacted_thinking') {
+        return {
+            type: 'redacted_thinking',
+            data: expectString(raw.data, `messages[${messageIndex}].content[${blockIndex}].data`),
         };
     }
 
