@@ -12,3 +12,6 @@
 # Node / Bun dependencies
 node_modules/
 .bun/
+
+# Local proxy state
+.claude-codex/

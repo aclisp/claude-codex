@@ -1,7 +1,7 @@
 import { ProxyValidationError } from '../protocol/errors.ts';
 
 export interface AnthropicMessageRequest {
-    model: string;
+    model?: string;
     max_tokens: number;
     messages: AnthropicMessage[];
     system?: AnthropicSystemPrompt;
@@ -88,11 +88,13 @@ export function parseAnthropicRequest(input: unknown): AnthropicMessageRequest {
     validateUnsupportedRequestFields(raw);
 
     const request: AnthropicMessageRequest = {
-        model: expectString(raw.model, 'model'),
         max_tokens: expectPositiveInteger(raw.max_tokens, 'max_tokens'),
         messages: parseMessages(raw.messages),
     };
 
+    if (raw.model !== undefined) {
+        request.model = expectString(raw.model, 'model');
+    }
     if (raw.system !== undefined) {
         request.system = parseSystemPrompt(raw.system);
     }

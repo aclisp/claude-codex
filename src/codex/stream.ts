@@ -1,0 +1,482 @@
+import type { Response, ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
+import { ProxyError } from '../protocol/errors.ts';
+import type { InternalAssistantEvent, InternalMessageEndEvent } from '../protocol/events.ts';
+import type { InternalUsage } from '../protocol/usage.ts';
+import { createMessageId, shortHash } from '../runtime/id.ts';
+import { encodeToolId } from '../tools/tool-id.ts';
+
+export class CodexApiError extends ProxyError {
+    readonly code?: string;
+    readonly payload?: unknown;
+
+    constructor(message: string, options?: { code?: string; payload?: unknown; httpStatus?: number }) {
+        super(message, {
+            httpStatus: options?.httpStatus ?? 502,
+            errorType: mapCodexErrorType(options?.httpStatus, options?.code, message),
+        });
+        this.name = 'CodexApiError';
+        this.code = options?.code;
+        this.payload = options?.payload;
+    }
+}
+
+export class CodexProtocolError extends ProxyError {
+    readonly payload?: unknown;
+
+    constructor(message: string, options?: { payload?: unknown }) {
+        super(message, { httpStatus: 502, errorType: 'api_error' });
+        this.name = 'CodexProtocolError';
+        this.payload = options?.payload;
+    }
+}
+
+export interface ProcessCodexStreamOptions {
+    model: string;
+    messageId?: string;
+    createdAt?: number;
+    onResponseId?: (responseId: string) => void;
+    onOutputItemDone?: (item: ResponseOutputItem) => void;
+}
+
+interface TextBlockState {
+    kind: 'text';
+    index: number;
+    text: string;
+    started: boolean;
+    ended: boolean;
+}
+
+interface ToolBlockState {
+    kind: 'tool';
+    index: number;
+    id: string;
+    callId: string;
+    itemId: string;
+    name: string;
+    partialJson: string;
+    started: boolean;
+    ended: boolean;
+}
+
+type BlockState = TextBlockState | ToolBlockState;
+
+export async function* mapRawCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
+    for await (const event of events) {
+        const type = typeof event.type === 'string' ? event.type : undefined;
+        if (!type) {
+            continue;
+        }
+
+        if (type === 'error') {
+            const code = typeof event.code === 'string' ? event.code : undefined;
+            const message = typeof event.message === 'string' ? event.message : (code ?? 'Unknown Codex error');
+            throw new CodexApiError(`Codex error: ${message}`, { code, payload: event });
+        }
+
+        if (type === 'response.failed') {
+            const response = asRecord(event.response);
+            const error = asRecord(response?.error);
+            const code = typeof error?.code === 'string' ? error.code : undefined;
+            const message = typeof error?.message === 'string' ? error.message : 'Codex response failed';
+            throw new CodexApiError(message, { code, payload: event });
+        }
+
+        if (type === 'response.done' || type === 'response.incomplete') {
+            yield {
+                ...event,
+                type: 'response.completed',
+                response: normalizeResponse(event.response),
+            } as ResponseStreamEvent;
+            return;
+        }
+
+        yield event as unknown as ResponseStreamEvent;
+
+        if (type === 'response.completed') {
+            return;
+        }
+    }
+}
+
+export async function* processCodexStream(
+    events: AsyncIterable<ResponseStreamEvent>,
+    options: ProcessCodexStreamOptions,
+): AsyncGenerator<InternalAssistantEvent> {
+    let messageStarted = false;
+    let nextContentIndex = 0;
+    let sawTool = false;
+    let upstreamResponseId: string | undefined;
+    const blocksByOutputIndex = new Map<number, BlockState>();
+    const blocksByItemId = new Map<string, BlockState>();
+
+    const createStart = (): InternalAssistantEvent | undefined => {
+        if (messageStarted) {
+            return undefined;
+        }
+        messageStarted = true;
+        return {
+            type: 'message_start',
+            messageId: options.messageId ?? createMessageId(),
+            model: options.model,
+            createdAt: options.createdAt ?? Date.now(),
+        };
+    };
+
+    const ensureTextBlock = (outputIndex: number, itemId?: string): TextBlockState => {
+        const existing = blocksByOutputIndex.get(outputIndex);
+        if (existing?.kind === 'text') {
+            return existing;
+        }
+        const block: TextBlockState = {
+            kind: 'text',
+            index: nextContentIndex,
+            text: '',
+            started: false,
+            ended: false,
+        };
+        nextContentIndex += 1;
+        blocksByOutputIndex.set(outputIndex, block);
+        if (itemId) {
+            blocksByItemId.set(itemId, block);
+        }
+        return block;
+    };
+
+    const ensureToolBlock = (outputIndex: number, item: { id?: string; call_id: string; name: string; arguments?: string }): ToolBlockState => {
+        const existing = blocksByOutputIndex.get(outputIndex);
+        if (existing?.kind === 'tool') {
+            return existing;
+        }
+        const itemId = item.id && item.id.length > 0 ? item.id : `fc_${shortHash(item.call_id, 24)}`;
+        const block: ToolBlockState = {
+            kind: 'tool',
+            index: nextContentIndex,
+            id: encodeToolId({ call: item.call_id, item: itemId }),
+            callId: item.call_id,
+            itemId,
+            name: item.name,
+            partialJson: item.arguments ?? '',
+            started: false,
+            ended: false,
+        };
+        nextContentIndex += 1;
+        blocksByOutputIndex.set(outputIndex, block);
+        blocksByItemId.set(itemId, block);
+        sawTool = true;
+        return block;
+    };
+
+    const startBlockEvents = function* (block: BlockState): Generator<InternalAssistantEvent> {
+        const start = createStart();
+        if (start) {
+            yield start;
+        }
+
+        if (block.started) {
+            return;
+        }
+        block.started = true;
+
+        if (block.kind === 'text') {
+            yield {
+                type: 'text_start',
+                index: block.index,
+            };
+            return;
+        }
+
+        yield {
+            type: 'tool_start',
+            index: block.index,
+            id: block.id,
+            name: block.name,
+        };
+    };
+
+    for await (const event of events) {
+        if (event.type === 'response.created') {
+            upstreamResponseId = event.response.id;
+            options.onResponseId?.(upstreamResponseId);
+            const start = createStart();
+            if (start) {
+                yield start;
+            }
+            continue;
+        }
+
+        if (event.type === 'response.output_item.added') {
+            const item = event.item;
+            if (item.type === 'message') {
+                const block = ensureTextBlock(event.output_index, item.id);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
+            } else if (item.type === 'function_call') {
+                const block = ensureToolBlock(event.output_index, item);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
+                if (block.partialJson.length > 0) {
+                    yield {
+                        type: 'tool_input_delta',
+                        index: block.index,
+                        partialJson: block.partialJson,
+                    };
+                }
+            }
+            continue;
+        }
+
+        if (event.type === 'response.output_text.delta') {
+            const block = ensureTextBlock(event.output_index, event.item_id);
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            block.text += event.delta;
+            yield {
+                type: 'text_delta',
+                index: block.index,
+                delta: event.delta,
+            };
+            continue;
+        }
+
+        if (event.type === 'response.refusal.delta') {
+            const block = ensureTextBlock(event.output_index, event.item_id);
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            block.text += event.delta;
+            yield {
+                type: 'text_delta',
+                index: block.index,
+                delta: event.delta,
+            };
+            continue;
+        }
+
+        if (event.type === 'response.function_call_arguments.delta') {
+            const block = getToolBlock(blocksByItemId, blocksByOutputIndex, event.item_id, event.output_index);
+            if (!block) {
+                continue;
+            }
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            block.partialJson += event.delta;
+            yield {
+                type: 'tool_input_delta',
+                index: block.index,
+                partialJson: event.delta,
+            };
+            continue;
+        }
+
+        if (event.type === 'response.function_call_arguments.done') {
+            const block = getToolBlock(blocksByItemId, blocksByOutputIndex, event.item_id, event.output_index);
+            if (!block) {
+                continue;
+            }
+            for (const startEvent of startBlockEvents(block)) {
+                yield startEvent;
+            }
+            if (event.arguments.startsWith(block.partialJson)) {
+                const delta = event.arguments.slice(block.partialJson.length);
+                if (delta.length > 0) {
+                    yield {
+                        type: 'tool_input_delta',
+                        index: block.index,
+                        partialJson: delta,
+                    };
+                }
+            }
+            block.partialJson = event.arguments;
+            continue;
+        }
+
+        if (event.type === 'response.output_item.done') {
+            options.onOutputItemDone?.(event.item);
+            if (event.item.type === 'message') {
+                const block = ensureTextBlock(event.output_index, event.item.id);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
+                block.text = event.item.content.map((part) => (part.type === 'output_text' ? part.text : part.refusal)).join('');
+                if (!block.ended) {
+                    block.ended = true;
+                    yield {
+                        type: 'text_end',
+                        index: block.index,
+                        text: block.text,
+                    };
+                }
+            } else if (event.item.type === 'function_call') {
+                const block = ensureToolBlock(event.output_index, event.item);
+                for (const startEvent of startBlockEvents(block)) {
+                    yield startEvent;
+                }
+                block.partialJson = event.item.arguments || block.partialJson || '{}';
+                if (!block.ended) {
+                    block.ended = true;
+                    yield {
+                        type: 'tool_end',
+                        index: block.index,
+                        id: block.id,
+                        name: block.name,
+                        input: parseToolInput(block.partialJson),
+                    };
+                }
+            }
+            continue;
+        }
+
+        if (event.type === 'response.failed') {
+            throw new CodexApiError(event.response.error?.message ?? 'Codex response failed', {
+                code: event.response.error?.code ?? undefined,
+                payload: event,
+            });
+        }
+
+        if (event.type === 'response.completed') {
+            const response = event.response;
+            upstreamResponseId = response.id;
+            options.onResponseId?.(response.id);
+            const start = createStart();
+            if (start) {
+                yield start;
+            }
+            for (const closeEvent of closeOpenBlocks(blocksByOutputIndex)) {
+                yield closeEvent;
+            }
+            if (response.status === 'failed' || response.status === 'cancelled') {
+                throw new CodexApiError(response.error?.message ?? `Codex response ${response.status}`, {
+                    code: response.error?.code ?? response.status,
+                    payload: response,
+                });
+            }
+            yield {
+                type: 'message_end',
+                stopReason: mapStopReason(response, sawTool),
+                usage: mapUsage(response),
+                upstreamResponseId,
+            } satisfies InternalMessageEndEvent;
+            return;
+        }
+
+        if (event.type === 'error') {
+            throw new CodexApiError(event.message || 'Codex stream error', {
+                code: event.code ?? undefined,
+                payload: event,
+            });
+        }
+    }
+}
+
+function getToolBlock(
+    byItemId: Map<string, BlockState>,
+    byOutputIndex: Map<number, BlockState>,
+    itemId: string,
+    outputIndex: number,
+): ToolBlockState | undefined {
+    const byItem = byItemId.get(itemId);
+    if (byItem?.kind === 'tool') {
+        return byItem;
+    }
+    const byOutput = byOutputIndex.get(outputIndex);
+    return byOutput?.kind === 'tool' ? byOutput : undefined;
+}
+
+function* closeOpenBlocks(blocks: Map<number, BlockState>): Generator<InternalAssistantEvent> {
+    for (const block of blocks.values()) {
+        if (!block.started || block.ended) {
+            continue;
+        }
+        block.ended = true;
+        if (block.kind === 'text') {
+            yield {
+                type: 'text_end',
+                index: block.index,
+                text: block.text,
+            };
+        } else {
+            yield {
+                type: 'tool_end',
+                index: block.index,
+                id: block.id,
+                name: block.name,
+                input: parseToolInput(block.partialJson || '{}'),
+            };
+        }
+    }
+}
+
+function parseToolInput(value: string): Record<string, unknown> {
+    try {
+        const parsed = JSON.parse(value || '{}');
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // Fall through to protocol error below.
+    }
+    throw new CodexProtocolError('Codex emitted malformed function-call JSON arguments.', { payload: value });
+}
+
+function mapUsage(response: Response): InternalUsage | undefined {
+    if (!response.usage) {
+        return undefined;
+    }
+    return {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cacheReadInputTokens: response.usage.input_tokens_details?.cached_tokens,
+    };
+}
+
+function mapStopReason(response: Response, sawTool: boolean): InternalMessageEndEvent['stopReason'] {
+    if (sawTool) {
+        return 'tool_use';
+    }
+    if (response.status === 'incomplete') {
+        return 'max_tokens';
+    }
+    return 'end_turn';
+}
+
+function normalizeResponse(value: unknown): unknown {
+    const response = asRecord(value);
+    if (!response) {
+        return value;
+    }
+    const status = typeof response.status === 'string' ? response.status : undefined;
+    return {
+        ...response,
+        status,
+    };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+    return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function mapCodexErrorType(status: number | undefined, code: string | undefined, message: string) {
+    if (status === 401) {
+        return 'authentication_error';
+    }
+    if (status === 403) {
+        return 'permission_error';
+    }
+    if (status === 413) {
+        return 'request_too_large';
+    }
+    if (status === 429 || /usage_limit|rate_limit|quota|billing|usage/i.test(code ?? message)) {
+        return 'rate_limit_error';
+    }
+    if (status === 503 || status === 529 || /overloaded|unavailable/i.test(message)) {
+        return 'overloaded_error';
+    }
+    if (/context|maximum context|too many tokens/i.test(message)) {
+        return 'invalid_request_error';
+    }
+    return 'api_error';
+}

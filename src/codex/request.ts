@@ -10,12 +10,13 @@ import type {
 import { parseAnthropicRequest } from '../anthropic/request.ts';
 import { ProxyValidationError } from '../protocol/errors.ts';
 import { decodeToolId } from '../tools/tool-id.ts';
-import { type CodexModelId, validateCodexModelId } from './models.ts';
+import { type CodexModelId, DEFAULT_CODEX_MODEL_ID, validateCodexModelId } from './models.ts';
 
 export type CodexReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 export type CodexTextVerbosity = 'low' | 'medium' | 'high';
 
 export interface BuildCodexRequestOptions {
+    defaultModel?: CodexModelId;
     defaultEffort?: CodexReasoningEffort;
     promptCacheKey?: string;
     textVerbosity?: CodexTextVerbosity;
@@ -41,6 +42,7 @@ export interface CodexResponsesRequest {
         summary: 'auto';
     };
     prompt_cache_key?: string;
+    previous_response_id?: string;
 }
 
 interface CodexInputMessage {
@@ -94,7 +96,7 @@ export function translateAnthropicToCodex(input: unknown, options?: BuildCodexRe
 }
 
 export function buildCodexRequest(request: AnthropicMessageRequest, options?: BuildCodexRequestOptions): CodexResponsesRequest {
-    const model = validateCodexModelId(request.model);
+    const model = validateCodexModelId(request.model ?? options?.defaultModel ?? DEFAULT_CODEX_MODEL_ID);
     const toolChoice = request.tool_choice?.type === 'none' ? 'none' : 'auto';
     const translatedInput = translateMessages(request);
     const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'high');
