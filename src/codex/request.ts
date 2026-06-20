@@ -1,0 +1,330 @@
+import type { Tool as OpenAIResponseTool, ResponseCreateParamsStreaming, ResponseInput } from 'openai/resources/responses/responses.js';
+import type {
+    AnthropicAssistantContentBlock,
+    AnthropicMessageRequest,
+    AnthropicSystemPrompt,
+    AnthropicTool,
+    AnthropicToolResultBlock,
+    AnthropicUserContentBlock,
+} from '../anthropic/request.ts';
+import { parseAnthropicRequest } from '../anthropic/request.ts';
+import { ProxyValidationError } from '../protocol/errors.ts';
+import { decodeToolId } from '../tools/tool-id.ts';
+import { type CodexModelId, validateCodexModelId } from './models.ts';
+
+export type CodexReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+export type CodexTextVerbosity = 'low' | 'medium' | 'high';
+
+export interface BuildCodexRequestOptions {
+    defaultEffort?: CodexReasoningEffort;
+    promptCacheKey?: string;
+    textVerbosity?: CodexTextVerbosity;
+}
+
+export interface CodexResponsesRequest {
+    model: CodexModelId;
+    store: false;
+    stream: true;
+    instructions: string;
+    input: ResponseInput;
+    include: ResponseCreateParamsStreaming['include'];
+    text: {
+        verbosity: CodexTextVerbosity;
+    };
+    max_output_tokens: number;
+    tool_choice: 'auto' | 'none';
+    parallel_tool_calls: true;
+    tools?: OpenAIResponseTool[];
+    temperature?: number;
+    reasoning?: {
+        effort: CodexReasoningEffort;
+        summary: 'auto';
+    };
+    prompt_cache_key?: string;
+}
+
+interface CodexInputMessage {
+    role: 'user';
+    content: CodexInputContent[];
+}
+
+type CodexInputContent = CodexInputText | CodexInputImage;
+
+interface CodexInputText {
+    type: 'input_text';
+    text: string;
+}
+
+interface CodexInputImage {
+    type: 'input_image';
+    detail: 'auto';
+    image_url: string;
+}
+
+interface CodexAssistantMessageItem {
+    type: 'message';
+    role: 'assistant';
+    id: string;
+    status: 'completed';
+    content: Array<{
+        type: 'output_text';
+        text: string;
+        annotations: [];
+    }>;
+}
+
+interface CodexFunctionCallItem {
+    type: 'function_call';
+    id: string;
+    call_id: string;
+    name: string;
+    arguments: string;
+}
+
+interface CodexFunctionCallOutputItem {
+    type: 'function_call_output';
+    call_id: string;
+    output: string;
+}
+
+type CodexInputItem = CodexInputMessage | CodexAssistantMessageItem | CodexFunctionCallItem | CodexFunctionCallOutputItem;
+
+export function translateAnthropicToCodex(input: unknown, options?: BuildCodexRequestOptions): CodexResponsesRequest {
+    return buildCodexRequest(parseAnthropicRequest(input), options);
+}
+
+export function buildCodexRequest(request: AnthropicMessageRequest, options?: BuildCodexRequestOptions): CodexResponsesRequest {
+    const model = validateCodexModelId(request.model);
+    const toolChoice = request.tool_choice?.type === 'none' ? 'none' : 'auto';
+    const translatedInput = translateMessages(request);
+    const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'high');
+
+    const body: CodexResponsesRequest = {
+        model,
+        store: false,
+        stream: true,
+        instructions: systemPromptToInstructions(request.system),
+        input: translatedInput as ResponseInput,
+        include: ['reasoning.encrypted_content'],
+        text: { verbosity: options?.textVerbosity ?? 'low' },
+        max_output_tokens: request.max_tokens,
+        tool_choice: toolChoice,
+        parallel_tool_calls: true,
+        reasoning: {
+            effort,
+            summary: 'auto',
+        },
+    };
+
+    if (request.temperature !== undefined) {
+        body.temperature = request.temperature;
+    }
+    if (options?.promptCacheKey !== undefined) {
+        body.prompt_cache_key = options.promptCacheKey;
+    }
+    if (request.tools !== undefined && request.tools.length > 0 && toolChoice !== 'none') {
+        body.tools = translateTools(request.tools);
+    }
+
+    return body;
+}
+
+export function resolveReasoningEffort(
+    request: Pick<AnthropicMessageRequest, 'output_config' | 'thinking'>,
+    proxyDefault: CodexReasoningEffort,
+): CodexReasoningEffort {
+    if (request.output_config?.effort !== undefined) {
+        return normalizeEffort(request.output_config.effort, 'output_config.effort');
+    }
+
+    if (request.thinking !== undefined) {
+        if (request.thinking.type === 'disabled') {
+            return 'none';
+        }
+        if (request.thinking.budget_tokens !== undefined) {
+            return effortFromThinkingBudget(request.thinking.budget_tokens);
+        }
+        return 'high';
+    }
+
+    return proxyDefault;
+}
+
+export function systemPromptToInstructions(system: AnthropicSystemPrompt | undefined): string {
+    if (system === undefined) {
+        return '';
+    }
+    if (typeof system === 'string') {
+        return system;
+    }
+    return system.map((block) => block.text).join('\n\n');
+}
+
+function translateMessages(request: AnthropicMessageRequest): CodexInputItem[] {
+    const input: CodexInputItem[] = [];
+
+    for (const [messageIndex, message] of request.messages.entries()) {
+        if (message.role === 'user') {
+            input.push(...translateUserMessage(message.content));
+            continue;
+        }
+        input.push(...translateAssistantMessage(message.content, messageIndex));
+    }
+
+    return input;
+}
+
+function translateUserMessage(content: AnthropicMessageRequest['messages'][number]['content']): CodexInputItem[] {
+    if (typeof content === 'string') {
+        return [
+            {
+                role: 'user',
+                content: [{ type: 'input_text', text: content }],
+            },
+        ];
+    }
+
+    const items: CodexInputItem[] = [];
+    const pendingContent: CodexInputContent[] = [];
+    const flushPendingContent = () => {
+        if (pendingContent.length === 0) {
+            return;
+        }
+        items.push({
+            role: 'user',
+            content: [...pendingContent],
+        });
+        pendingContent.length = 0;
+    };
+
+    for (const block of content as AnthropicUserContentBlock[]) {
+        if (block.type === 'text') {
+            pendingContent.push({
+                type: 'input_text',
+                text: block.text,
+            });
+            continue;
+        }
+
+        if (block.type === 'image') {
+            pendingContent.push({
+                type: 'input_image',
+                detail: 'auto',
+                image_url: `data:${block.source.media_type};base64,${block.source.data}`,
+            });
+            continue;
+        }
+
+        flushPendingContent();
+        items.push(translateToolResult(block));
+    }
+
+    flushPendingContent();
+    return items;
+}
+
+function translateAssistantMessage(content: AnthropicMessageRequest['messages'][number]['content'], messageIndex: number): CodexInputItem[] {
+    if (typeof content === 'string') {
+        return [createAssistantTextItem(content, messageIndex, 0)];
+    }
+
+    return (content as AnthropicAssistantContentBlock[]).map((block, blockIndex) => {
+        if (block.type === 'text') {
+            return createAssistantTextItem(block.text, messageIndex, blockIndex);
+        }
+
+        return translateToolUse(block);
+    });
+}
+
+function createAssistantTextItem(text: string, messageIndex: number, blockIndex: number): CodexAssistantMessageItem {
+    return {
+        type: 'message',
+        role: 'assistant',
+        id: `msg_ccx_replay_${messageIndex}_${blockIndex}`,
+        status: 'completed',
+        content: [
+            {
+                type: 'output_text',
+                text,
+                annotations: [],
+            },
+        ],
+    };
+}
+
+function translateToolUse(block: AnthropicAssistantContentBlock): CodexFunctionCallItem {
+    if (block.type !== 'tool_use') {
+        throw new ProxyValidationError(`Unsupported assistant content block type "${block.type}".`);
+    }
+
+    const identity = decodeToolId(block.id);
+    return {
+        type: 'function_call',
+        id: identity.item,
+        call_id: identity.call,
+        name: block.name,
+        arguments: JSON.stringify(block.input),
+    };
+}
+
+function translateToolResult(block: AnthropicUserContentBlock): CodexFunctionCallOutputItem {
+    if (block.type !== 'tool_result') {
+        throw new ProxyValidationError(`Unsupported user content block type "${block.type}".`);
+    }
+
+    return {
+        type: 'function_call_output',
+        call_id: decodeToolId(block.tool_use_id).call,
+        output: toolResultOutput(block),
+    };
+}
+
+function toolResultOutput(block: AnthropicToolResultBlock): string {
+    if (block.content === undefined) {
+        return '';
+    }
+    if (typeof block.content === 'string') {
+        return block.content;
+    }
+    return block.content.map((item) => item.text).join('\n');
+}
+
+function translateTools(tools: AnthropicTool[]): OpenAIResponseTool[] {
+    return tools.map(
+        (tool) =>
+            ({
+                type: 'function',
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.input_schema,
+                strict: null,
+            }) as OpenAIResponseTool,
+    );
+}
+
+function normalizeEffort(value: string, field: string): CodexReasoningEffort {
+    if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') {
+        return value;
+    }
+    if (value === 'max') {
+        return 'xhigh';
+    }
+    if (value === 'none' || value === 'off' || value === 'disabled') {
+        return 'none';
+    }
+    throw new ProxyValidationError(`${field} must be one of low, medium, high, xhigh, max, or none.`);
+}
+
+function effortFromThinkingBudget(budgetTokens: number): CodexReasoningEffort {
+    if (budgetTokens <= 4096) {
+        return 'low';
+    }
+    if (budgetTokens <= 16_384) {
+        return 'medium';
+    }
+    if (budgetTokens <= 32_768) {
+        return 'high';
+    }
+    return 'xhigh';
+}
