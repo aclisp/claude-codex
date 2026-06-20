@@ -32,7 +32,6 @@ export interface CodexResponsesRequest {
     text: {
         verbosity: CodexTextVerbosity;
     };
-    max_output_tokens: number;
     tool_choice: 'auto' | 'none';
     parallel_tool_calls: true;
     tools?: OpenAIResponseTool[];
@@ -109,7 +108,6 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
         input: translatedInput as ResponseInput,
         include: ['reasoning.encrypted_content'],
         text: { verbosity: options?.textVerbosity ?? 'low' },
-        max_output_tokens: request.max_tokens,
         tool_choice: toolChoice,
         parallel_tool_calls: true,
         reasoning: {

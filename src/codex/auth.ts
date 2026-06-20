@@ -1,8 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { ProxyError } from '../protocol/errors.ts';
 
-const JWT_CLAIM_PATH = 'https://api.openai.com/auth';
-
 export interface CodexCredentials {
     token: string;
     accountId: string;
@@ -41,10 +39,10 @@ export class CodexAuthReader {
             });
         }
 
-        const token = findToken(parsed);
-        if (!token) {
+        const auth = parseCodexAuth(parsed);
+        if (!auth.accessToken) {
             throw new ProxyError(
-                `Codex file-backed auth is required, but ${this.authPath} does not contain a usable token. Keyring-only auth is unsupported in v1.`,
+                `Codex file-backed auth is required, but ${this.authPath} does not contain tokens.access_token. Keyring-only auth is unsupported in v1.`,
                 {
                     httpStatus: 401,
                     errorType: 'authentication_error',
@@ -52,17 +50,16 @@ export class CodexAuthReader {
             );
         }
 
-        const accountId = findAccountId(parsed) ?? extractAccountId(token);
-        if (!accountId) {
-            throw new ProxyError('Codex auth token does not expose a ChatGPT account id. Keep Codex running or run codex login.', {
+        if (!auth.accountId) {
+            throw new ProxyError(`Codex auth file at ${this.authPath} does not contain tokens.account_id. Keep Codex running or run codex login.`, {
                 httpStatus: 401,
                 errorType: 'authentication_error',
             });
         }
 
         this.cached = {
-            token,
-            accountId,
+            token: auth.accessToken,
+            accountId: auth.accountId,
             authPath: this.authPath,
             mtimeMs,
         };
@@ -78,47 +75,20 @@ export class CodexAuthReader {
     }
 }
 
-function findToken(value: unknown): string | undefined {
+function parseCodexAuth(value: unknown): { accessToken?: string; accountId?: string } {
     const root = asRecord(value);
     if (!root) {
-        return undefined;
+        return {};
     }
 
-    const candidates = [
-        root.id_token,
-        root.access_token,
-        root.token,
-        asRecord(root.tokens)?.id_token,
-        asRecord(root.tokens)?.access_token,
-        asRecord(root.auth)?.id_token,
-        asRecord(root.auth)?.access_token,
-    ];
+    const tokens = asRecord(root.tokens);
+    const accessToken = tokens?.access_token;
+    const accountId = tokens?.account_id;
 
-    return candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
-}
-
-function findAccountId(value: unknown): string | undefined {
-    const root = asRecord(value);
-    if (!root) {
-        return undefined;
-    }
-
-    const candidates = [root.chatgpt_account_id, root.account_id, asRecord(root.tokens)?.chatgpt_account_id, asRecord(root.auth)?.chatgpt_account_id];
-
-    return candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
-}
-
-function extractAccountId(token: string): string | undefined {
-    try {
-        const [, payload] = token.split('.');
-        if (!payload) {
-            return undefined;
-        }
-        const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
-        return asRecord(parsed[JWT_CLAIM_PATH])?.chatgpt_account_id as string | undefined;
-    } catch {
-        return undefined;
-    }
+    return {
+        accessToken: typeof accessToken === 'string' && accessToken.length > 0 ? accessToken : undefined,
+        accountId: typeof accountId === 'string' && accountId.length > 0 ? accountId : undefined,
+    };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

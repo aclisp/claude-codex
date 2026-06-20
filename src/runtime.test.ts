@@ -18,14 +18,15 @@ describe('Codex auth reader', () => {
             authPath,
             JSON.stringify({
                 tokens: {
-                    id_token: createJwt('acct_test'),
+                    access_token: 'access_test',
+                    account_id: 'acct_test',
                 },
             }),
         );
 
         const credentials = await new CodexAuthReader(authPath).read();
         expect(credentials.accountId).toBe('acct_test');
-        expect(credentials.token).toContain('.');
+        expect(credentials.token).toBe('access_test');
         expect(credentials.authPath).toBe(authPath);
     });
 });
@@ -170,7 +171,7 @@ describe('Codex transport', () => {
     test('falls back to SSE when WebSocket fails before upstream events', async () => {
         const dir = await mkdtemp('/private/tmp/claude-codex-fallback-');
         const authPath = join(dir, 'auth.json');
-        await writeFile(authPath, JSON.stringify({ tokens: { id_token: createJwt('acct_test') } }));
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
         let fetchCalls = 0;
         const client = new CodexClient({
             baseUrl: 'https://chatgpt.com/backend-api',
@@ -200,7 +201,7 @@ describe('Codex transport', () => {
 async function createTestServer() {
     const dir = await mkdtemp('/private/tmp/claude-codex-server-');
     const authPath = join(dir, 'auth.json');
-    await writeFile(authPath, JSON.stringify({ tokens: { id_token: createJwt('acct_test') } }));
+    await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
     const config = loadRuntimeConfig(['--auth-path', authPath, '--state-dir', join(dir, '.claude-codex')], { HOME: dir });
     const client = new CodexClient({
         baseUrl: config.codexBaseUrl,
@@ -265,11 +266,6 @@ function createSseResponse(): Response {
         status: 200,
         headers: { 'content-type': 'text/event-stream' },
     });
-}
-
-function createJwt(accountId: string): string {
-    const payload = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: accountId } })).toString('base64url');
-    return `header.${payload}.signature`;
 }
 
 async function collectAsync<T>(events: AsyncIterable<T>): Promise<T[]> {

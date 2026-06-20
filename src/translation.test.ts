@@ -20,7 +20,6 @@ describe('Anthropic to Codex request translation', () => {
             store: false,
             stream: true,
             instructions: 'Be concise.',
-            max_output_tokens: 512,
             tool_choice: 'auto',
             parallel_tool_calls: true,
             text: { verbosity: 'low' },
