@@ -1,0 +1,14 @@
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Node / Bun dependencies
+node_modules/
+.bun/
