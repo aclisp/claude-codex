@@ -1,4 +1,4 @@
-import { encode } from 'gpt-tokenizer/model/gpt-4o';
+import { encode } from 'gpt-tokenizer/model/gpt-5';
 import type { CodexResponsesRequest } from './request.ts';
 
 const IMAGE_TOKEN_ESTIMATE = 2000;

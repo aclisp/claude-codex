@@ -12,6 +12,6 @@
     "openai": "6.44.0"
   },
   "dependencies": {
-    "gpt-tokenizer": "^2.9.0"
+    "gpt-tokenizer": "^3.4.0"
   }
 }
