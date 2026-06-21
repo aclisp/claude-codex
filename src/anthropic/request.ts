@@ -2,7 +2,7 @@ import { ProxyValidationError } from '../protocol/errors.ts';
 
 export interface AnthropicMessageRequest {
     model?: string;
-    max_tokens: number;
+    max_tokens?: number;
     messages: AnthropicMessage[];
     system?: AnthropicSystemPrompt;
     tools?: AnthropicTool[];
@@ -80,7 +80,8 @@ export interface AnthropicTool {
 }
 
 export interface AnthropicToolChoice {
-    type: 'auto' | 'any' | 'none';
+    type: 'auto' | 'any' | 'none' | 'tool';
+    name?: string;
 }
 
 export interface AnthropicThinkingConfig {
@@ -90,19 +91,34 @@ export interface AnthropicThinkingConfig {
 
 export interface AnthropicOutputConfig {
     effort?: string;
+    format?: AnthropicOutputFormat;
+}
+
+export interface AnthropicOutputFormat {
+    type: 'json_schema';
+    name?: string;
+    schema: Record<string, unknown>;
+    strict?: boolean;
 }
 
 const UNSUPPORTED_BEHAVIOR_FIELDS = ['container', 'context_management', 'mcp_servers', 'service_tier'] as const;
 
-export function parseAnthropicRequest(input: unknown): AnthropicMessageRequest {
+export interface ParseAnthropicRequestOptions {
+    requireMaxTokens?: boolean;
+}
+
+export function parseAnthropicRequest(input: unknown, options?: ParseAnthropicRequestOptions): AnthropicMessageRequest {
     const raw = expectRecord(input, 'request body');
     validateUnsupportedRequestFields(raw);
+    const requireMaxTokens = options?.requireMaxTokens ?? true;
 
     const request: AnthropicMessageRequest = {
-        max_tokens: expectPositiveInteger(raw.max_tokens, 'max_tokens'),
         messages: parseMessages(raw.messages),
     };
 
+    if (requireMaxTokens || raw.max_tokens !== undefined) {
+        request.max_tokens = expectPositiveInteger(raw.max_tokens, 'max_tokens');
+    }
     if (raw.model !== undefined) {
         request.model = expectString(raw.model, 'model');
     }
@@ -346,7 +362,7 @@ function parseToolChoice(value: unknown): AnthropicToolChoice {
         return { type };
     }
     if (type === 'tool') {
-        throw new ProxyValidationError('Named forced tool_choice is unsupported in v1.');
+        return { type, name: expectNonEmptyString(raw.name, 'tool_choice.name') };
     }
     throw new ProxyValidationError(`Unsupported tool_choice type "${type}".`);
 }
@@ -371,6 +387,29 @@ function parseOutputConfig(value: unknown): AnthropicOutputConfig {
     if (raw.effort !== undefined) {
         parsed.effort = expectString(raw.effort, 'output_config.effort');
     }
+    if (raw.format !== undefined) {
+        parsed.format = parseOutputFormat(raw.format);
+    }
+    return parsed;
+}
+
+function parseOutputFormat(value: unknown): AnthropicOutputFormat {
+    const raw = expectRecord(value, 'output_config.format');
+    const type = expectString(raw.type, 'output_config.format.type');
+    if (type !== 'json_schema') {
+        throw new ProxyValidationError(`Unsupported output_config.format.type "${type}".`);
+    }
+
+    const parsed: AnthropicOutputFormat = {
+        type,
+        schema: expectRecord(raw.schema, 'output_config.format.schema'),
+    };
+    if (raw.name !== undefined) {
+        parsed.name = expectNonEmptyString(raw.name, 'output_config.format.name');
+    }
+    if (raw.strict !== undefined) {
+        parsed.strict = expectBoolean(raw.strict, 'output_config.format.strict');
+    }
     return parsed;
 }
 
@@ -393,6 +432,14 @@ function expectString(value: unknown, field: string): string {
         throw new ProxyValidationError(`${field} must be a string.`);
     }
     return value;
+}
+
+function expectNonEmptyString(value: unknown, field: string): string {
+    const parsed = expectString(value, field);
+    if (parsed.length === 0) {
+        throw new ProxyValidationError(`${field} must not be empty.`);
+    }
+    return parsed;
 }
 
 function expectBoolean(value: unknown, field: string): boolean {

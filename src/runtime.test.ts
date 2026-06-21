@@ -88,7 +88,7 @@ describe('Codex stream processing', () => {
             stop_reason: 'end_turn',
             stop_sequence: null,
             usage: {
-                input_tokens: 2,
+                input_tokens: 1,
                 output_tokens: 1,
                 cache_read_input_tokens: 1,
             },
@@ -291,6 +291,64 @@ describe('HTTP proxy server', () => {
             content: [{ type: 'text', text: 'Hello from Codex' }],
             stop_reason: 'end_turn',
         });
+    });
+
+    test('handles /v1/messages/count_tokens without max_tokens', async () => {
+        const { server } = await createTestServer();
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages/count_tokens', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    system: 'Be concise.',
+                    tools: [
+                        {
+                            name: 'lookup',
+                            description: 'Look up a value',
+                            input_schema: {
+                                type: 'object',
+                                properties: { key: { type: 'string' } },
+                            },
+                        },
+                    ],
+                    tool_choice: { type: 'tool', name: 'lookup' },
+                    output_config: {
+                        format: {
+                            type: 'json_schema',
+                            schema: {
+                                type: 'object',
+                                properties: { value: { type: 'string' } },
+                            },
+                        },
+                    },
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        const body = (await response.json()) as { input_tokens: number };
+        expect(body.input_tokens).toBeGreaterThan(0);
+    });
+
+    test('streams Anthropic ping frames after message_start', async () => {
+        const { server } = await createTestServer();
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-session-id': 'session-stream' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    stream: true,
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('event: ping');
     });
 });
 

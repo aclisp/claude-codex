@@ -13,6 +13,7 @@ export type InternalAssistantEvent =
     | InternalToolStartEvent
     | InternalToolInputDeltaEvent
     | InternalToolEndEvent
+    | InternalPingEvent
     | InternalMessageEndEvent
     | InternalErrorEvent;
 
@@ -84,6 +85,10 @@ export interface InternalToolEndEvent {
     id: string;
     name: string;
     input: Record<string, unknown>;
+}
+
+export interface InternalPingEvent {
+    type: 'ping';
 }
 
 export interface InternalMessageEndEvent {

@@ -629,10 +629,12 @@ function mapUsage(response: Response): InternalUsage | undefined {
     if (!response.usage) {
         return undefined;
     }
+    const inputTokens = response.usage.input_tokens;
+    const cachedTokens = Math.max(0, response.usage.input_tokens_details?.cached_tokens ?? 0);
     return {
-        inputTokens: response.usage.input_tokens,
+        inputTokens: Math.max(0, inputTokens - cachedTokens),
         outputTokens: response.usage.output_tokens,
-        cacheReadInputTokens: response.usage.input_tokens_details?.cached_tokens,
+        cacheReadInputTokens: cachedTokens,
     };
 }
 

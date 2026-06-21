@@ -28,6 +28,12 @@ export function toAnthropicSseFrames(events: Iterable<InternalAssistantEvent>): 
                     },
                 },
             });
+            frames.push({
+                event: 'ping',
+                data: {
+                    type: 'ping',
+                },
+            });
         } else if (event.type === 'text_start') {
             frames.push({
                 event: 'content_block_start',
@@ -136,6 +142,13 @@ export function toAnthropicSseFrames(events: Iterable<InternalAssistantEvent>): 
                 data: {
                     type: 'content_block_stop',
                     index: event.index,
+                },
+            });
+        } else if (event.type === 'ping') {
+            frames.push({
+                event: 'ping',
+                data: {
+                    type: 'ping',
                 },
             });
         } else if (event.type === 'message_end') {

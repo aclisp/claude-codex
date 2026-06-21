@@ -1,4 +1,10 @@
-import type { Tool as OpenAIResponseTool, ResponseCreateParamsStreaming, ResponseInput, ResponseReasoningItem } from 'openai/resources/responses/responses.js';
+import type {
+    Tool as OpenAIResponseTool,
+    ResponseCreateParamsStreaming,
+    ResponseInput,
+    ResponseReasoningItem,
+    ResponseTextConfig,
+} from 'openai/resources/responses/responses.js';
 import type {
     AnthropicAssistantContentBlock,
     AnthropicMessageRequest,
@@ -15,6 +21,7 @@ import { type CodexModelId, DEFAULT_CODEX_MODEL_ID, validateCodexModelId } from 
 
 export type CodexReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 export type CodexTextVerbosity = 'low' | 'medium' | 'high';
+type CodexToolChoice = NonNullable<ResponseCreateParamsStreaming['tool_choice']>;
 
 export interface BuildCodexRequestOptions {
     defaultModel?: CodexModelId;
@@ -30,10 +37,8 @@ export interface CodexResponsesRequest {
     instructions: string;
     input: ResponseInput;
     include: ResponseCreateParamsStreaming['include'];
-    text: {
-        verbosity: CodexTextVerbosity;
-    };
-    tool_choice: 'auto' | 'none';
+    text: ResponseTextConfig;
+    tool_choice: CodexToolChoice;
     parallel_tool_calls: true;
     tools?: OpenAIResponseTool[];
     temperature?: number;
@@ -97,7 +102,7 @@ export function translateAnthropicToCodex(input: unknown, options?: BuildCodexRe
 
 export function buildCodexRequest(request: AnthropicMessageRequest, options?: BuildCodexRequestOptions): CodexResponsesRequest {
     const model = validateCodexModelId(request.model ?? options?.defaultModel ?? DEFAULT_CODEX_MODEL_ID);
-    const toolChoice = request.tool_choice?.type === 'none' ? 'none' : 'auto';
+    const toolChoice = mapToolChoice(request.tool_choice);
     const translatedInput = translateMessages(request);
     const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'high');
 
@@ -108,7 +113,7 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
         instructions: systemPromptToInstructions(request.system),
         input: translatedInput as ResponseInput,
         include: ['reasoning.encrypted_content'],
-        text: { verbosity: options?.textVerbosity ?? 'low' },
+        text: buildTextConfig(request, options?.textVerbosity ?? 'low'),
         tool_choice: toolChoice,
         parallel_tool_calls: true,
         reasoning: {
@@ -128,6 +133,70 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
     }
 
     return body;
+}
+
+export function mapToolChoice(choice: AnthropicMessageRequest['tool_choice']): CodexToolChoice {
+    if (choice === undefined || choice.type === 'auto') {
+        return 'auto';
+    }
+    if (choice.type === 'none') {
+        return 'none';
+    }
+    if (choice.type === 'any') {
+        return 'required';
+    }
+    if (!choice.name) {
+        throw new ProxyValidationError('tool_choice.name is required when tool_choice.type is "tool".');
+    }
+    return { type: 'function', name: choice.name };
+}
+
+function buildTextConfig(request: AnthropicMessageRequest, verbosity: CodexTextVerbosity): ResponseTextConfig {
+    const text: ResponseTextConfig = { verbosity };
+    const format = request.output_config?.format;
+    if (format?.type === 'json_schema') {
+        text.format = {
+            type: 'json_schema',
+            name: format.name ?? 'response',
+            schema: normalizeStrictJsonSchema(format.schema),
+            strict: true,
+        };
+    }
+    return text;
+}
+
+export function normalizeStrictJsonSchema(schema: unknown): Record<string, unknown> {
+    const normalized = normalizeJsonSchemaValue(schema);
+    if (!isRecord(normalized)) {
+        throw new ProxyValidationError('output_config.format.schema must be a JSON object.');
+    }
+    return normalized;
+}
+
+function normalizeJsonSchemaValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(normalizeJsonSchemaValue);
+    }
+    if (!isRecord(value)) {
+        return value;
+    }
+
+    const result: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+        result[key] = normalizeJsonSchemaValue(child);
+    }
+
+    if (isRecord(result.properties)) {
+        result.required = Object.keys(result.properties);
+        if (result.additionalProperties === undefined) {
+            result.additionalProperties = false;
+        }
+    }
+    return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export function resolveReasoningEffort(

@@ -3,6 +3,7 @@ import { parseAnthropicRequest } from '../anthropic/request.ts';
 import { collectAnthropicMessage } from '../anthropic/response.ts';
 import { encodeSseFrame, toAnthropicSseFrames } from '../anthropic/sse.ts';
 import type { CodexClient } from '../codex/client.ts';
+import { countTranslatedTokens } from '../codex/count-tokens.ts';
 import { CODEX_MODEL_CATALOG } from '../codex/models.ts';
 import { buildCodexRequest } from '../codex/request.ts';
 import { isProxyError, ProxyError, ProxyValidationError, toAnthropicErrorBody } from '../protocol/errors.ts';
@@ -35,6 +36,8 @@ const SSE_HEADERS = {
     connection: 'keep-alive',
 };
 
+const STREAM_KEEPALIVE_INTERVAL_MS = 15_000;
+
 export function createProxyServer(config: ProxyRuntimeConfig, dependencies: ProxyServerDependencies): ProxyServer {
     const sessionStore = dependencies.sessionStore ?? createSessionStore(config.stateDir);
     const logger = dependencies.logger ?? consoleLogger;
@@ -53,6 +56,11 @@ export function createProxyServer(config: ProxyRuntimeConfig, dependencies: Prox
 
                 if (request.method === 'POST' && url.pathname === '/v1/messages') {
                     const response = await handleMessages(request, config, dependencies.codexClient, sessionStore, logger, startedAt);
+                    return response;
+                }
+
+                if (request.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
+                    const response = await handleCountTokens(request, config, logger, startedAt);
                     return response;
                 }
 
@@ -131,6 +139,27 @@ async function handleMessages(
     return jsonResponse(message);
 }
 
+async function handleCountTokens(request: Request, config: ProxyRuntimeConfig, logger: ProxyLogger, startedAt: number): Promise<Response> {
+    const rawBody = await readJsonBody(request, config.maxBodyBytes);
+    await traceDebugBody(config, rawBody);
+
+    const anthropicRequest = parseAnthropicRequest(rawBody, { requireMaxTokens: false });
+    const codexBody = buildCodexRequest(anthropicRequest, {
+        defaultModel: config.defaultModel,
+        defaultEffort: config.defaultEffort,
+        textVerbosity: config.textVerbosity,
+    });
+    const inputTokens = countTranslatedTokens(codexBody);
+    const response = jsonResponse({ input_tokens: inputTokens });
+    logRequest(logger, startedAt, {
+        route: '/v1/messages/count_tokens',
+        model: codexBody.model,
+        status: response.status,
+        inputTokens,
+    });
+    return response;
+}
+
 async function createStreamingResponse(
     events: AsyncIterable<InternalAssistantEvent>,
     abortController: AbortController,
@@ -160,11 +189,17 @@ async function createStreamingResponse(
             let cacheReadInputTokens: number | undefined;
             try {
                 enqueueEvent(controller, encoder, first.value);
+                let pendingNext = iterator.next();
                 while (true) {
-                    const next = await iterator.next();
+                    const next = await nextEventOrKeepalive(pendingNext);
+                    if (next === 'keepalive') {
+                        enqueuePing(controller, encoder);
+                        continue;
+                    }
                     if (next.done) {
                         break;
                     }
+                    pendingNext = iterator.next();
                     const event = next.value;
                     if (event.type === 'message_end') {
                         stopReason = event.stopReason;
@@ -204,6 +239,26 @@ async function createStreamingResponse(
 function enqueueEvent(controller: ReadableStreamDefaultController<Uint8Array>, encoder: TextEncoder, event: InternalAssistantEvent): void {
     for (const frame of toAnthropicSseFrames([event])) {
         controller.enqueue(encoder.encode(encodeSseFrame(frame)));
+    }
+}
+
+function enqueuePing(controller: ReadableStreamDefaultController<Uint8Array>, encoder: TextEncoder): void {
+    controller.enqueue(encoder.encode(encodeSseFrame({ event: 'ping', data: { type: 'ping' } })));
+}
+
+async function nextEventOrKeepalive(
+    pendingNext: Promise<IteratorResult<InternalAssistantEvent>>,
+): Promise<IteratorResult<InternalAssistantEvent> | 'keepalive'> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const keepalive = new Promise<'keepalive'>((resolve) => {
+        timeout = setTimeout(() => resolve('keepalive'), STREAM_KEEPALIVE_INTERVAL_MS);
+    });
+    try {
+        return await Promise.race([pendingNext, keepalive]);
+    } finally {
+        if (timeout !== undefined) {
+            clearTimeout(timeout);
+        }
     }
 }
 

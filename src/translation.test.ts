@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { collectAnthropicMessage } from './anthropic/response.ts';
 import { encodeAnthropicSse, toAnthropicSseFrames } from './anthropic/sse.ts';
+import { countTranslatedTokens } from './codex/count-tokens.ts';
 import { translateAnthropicToCodex } from './codex/request.ts';
 import { redactBody } from './http/server.ts';
 import { ProxyValidationError } from './protocol/errors.ts';
@@ -104,7 +105,7 @@ describe('Anthropic to Codex request translation', () => {
             messages: [{ role: 'user', content: 'read' }],
         });
 
-        expect(body.tool_choice).toBe('auto');
+        expect(body.tool_choice).toBe('required');
         expect(body.tools).toEqual([
             {
                 type: 'function',
@@ -118,6 +119,28 @@ describe('Anthropic to Codex request translation', () => {
                 strict: null,
             },
         ]);
+    });
+
+    test('translates named tool choice to forced OpenAI function choice', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            tool_choice: { type: 'tool', name: 'read_file' },
+            tools: [
+                {
+                    name: 'read_file',
+                    description: 'Read a file',
+                    input_schema: {
+                        type: 'object',
+                        properties: { path: { type: 'string' } },
+                        required: ['path'],
+                    },
+                },
+            ],
+            messages: [{ role: 'user', content: 'read' }],
+        });
+
+        expect(body.tool_choice).toEqual({ type: 'function', name: 'read_file' });
     });
 
     test('replays assistant tool calls using encoded proxy ids', () => {
@@ -284,6 +307,41 @@ describe('Anthropic to Codex request translation', () => {
         ).toBe('medium');
     });
 
+    test('translates output_config.format to Responses structured text format', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            output_config: {
+                format: {
+                    type: 'json_schema',
+                    name: 'answer_format',
+                    schema: {
+                        type: 'object',
+                        properties: {
+                            answer: { type: 'string' },
+                        },
+                    },
+                },
+            },
+            messages: [{ role: 'user', content: 'return json' }],
+        });
+
+        expect(body.text.format).toEqual({
+            type: 'json_schema',
+            name: 'answer_format',
+            schema: {
+                type: 'object',
+                properties: {
+                    answer: { type: 'string' },
+                },
+                required: ['answer'],
+                additionalProperties: false,
+            },
+            strict: true,
+        });
+        expect(countTranslatedTokens(body)).toBeGreaterThan(0);
+    });
+
     test('returns clear validation errors for unsupported request behavior', () => {
         expect(() =>
             translateAnthropicToCodex({
@@ -298,10 +356,10 @@ describe('Anthropic to Codex request translation', () => {
             translateAnthropicToCodex({
                 model: 'gpt-5.4-mini',
                 max_tokens: 128,
-                tool_choice: { type: 'tool', name: 'read_file' },
+                output_config: { format: { type: 'json_object', schema: {} } },
                 messages: [{ role: 'user', content: 'x' }],
             }),
-        ).toThrow('Named forced tool_choice is unsupported in v1.');
+        ).toThrow('Unsupported output_config.format.type "json_object".');
     });
 });
 
@@ -319,6 +377,7 @@ describe('Anthropic response encoding', () => {
         const frames = toAnthropicSseFrames(events);
         expect(frames.map((frame) => frame.event)).toEqual([
             'message_start',
+            'ping',
             'content_block_start',
             'content_block_delta',
             'content_block_delta',
@@ -327,6 +386,7 @@ describe('Anthropic response encoding', () => {
             'message_stop',
         ]);
         expect(encodeAnthropicSse(events)).toContain('event: message_start');
+        expect(encodeAnthropicSse(events)).toContain('event: ping');
         expect(encodeAnthropicSse(events)).toContain('"type":"text_delta","text":"Hel"');
     });
 
