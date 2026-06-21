@@ -104,13 +104,13 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
     const model = validateCodexModelId(request.model ?? options?.defaultModel ?? DEFAULT_CODEX_MODEL_ID);
     const toolChoice = mapToolChoice(request.tool_choice);
     const translatedInput = translateMessages(request);
-    const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'high');
+    const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'medium');
 
     const body: CodexResponsesRequest = {
         model,
         store: false,
         stream: true,
-        instructions: systemPromptToInstructions(request.system),
+        instructions: buildInstructions(request),
         input: translatedInput as ResponseInput,
         include: ['reasoning.encrypted_content'],
         text: buildTextConfig(request, options?.textVerbosity ?? 'low'),
@@ -214,7 +214,7 @@ export function resolveReasoningEffort(
         if (request.thinking.budget_tokens !== undefined) {
             return effortFromThinkingBudget(request.thinking.budget_tokens);
         }
-        return 'high';
+        return proxyDefault;
     }
 
     return proxyDefault;
@@ -230,10 +230,23 @@ export function systemPromptToInstructions(system: AnthropicSystemPrompt | undef
     return system.map((block) => block.text).join('\n\n');
 }
 
+function buildInstructions(request: AnthropicMessageRequest): string {
+    const parts = [systemPromptToInstructions(request.system)];
+    for (const message of request.messages) {
+        if (message.role === 'system') {
+            parts.push(systemPromptToInstructions(message.content as AnthropicSystemPrompt));
+        }
+    }
+    return parts.filter((part) => part.length > 0).join('\n\n');
+}
+
 function translateMessages(request: AnthropicMessageRequest): CodexInputItem[] {
     const input: CodexInputItem[] = [];
 
     for (const [messageIndex, message] of request.messages.entries()) {
+        if (message.role === 'system') {
+            continue;
+        }
         if (message.role === 'user') {
             input.push(...translateUserMessage(message.content));
             continue;

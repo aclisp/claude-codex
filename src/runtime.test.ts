@@ -34,6 +34,12 @@ describe('Codex auth reader', () => {
     });
 });
 
+describe('Runtime config', () => {
+    test('defaults Codex reasoning effort to medium', () => {
+        expect(loadRuntimeConfig([], { HOME: '/tmp/test-home' }).defaultEffort).toBe('medium');
+    });
+});
+
 describe('Codex stream processing', () => {
     test('maps raw Responses events to internal text events', async () => {
         const events = await collectAsync(

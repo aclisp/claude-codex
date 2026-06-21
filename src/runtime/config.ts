@@ -36,7 +36,7 @@ export function loadRuntimeConfig(args: string[] = process.argv.slice(2), env: R
         authPath: parsedArgs.authPath ?? env.CODEX_AUTH_PATH ?? `${codexHome}/auth.json`,
         stateDir: parsedArgs.stateDir ?? env.CLAUDE_CODEX_STATE_DIR ?? '.claude-codex',
         defaultModel: validateCodexModelId(parsedArgs.defaultModel ?? env.CLAUDE_CODEX_DEFAULT_MODEL ?? DEFAULT_CODEX_MODEL_ID),
-        defaultEffort: parseDefaultEffort(parsedArgs.defaultEffort ?? env.CLAUDE_CODEX_DEFAULT_EFFORT ?? 'high'),
+        defaultEffort: parseDefaultEffort(parsedArgs.defaultEffort ?? env.CLAUDE_CODEX_DEFAULT_EFFORT ?? 'medium'),
         textVerbosity: parseTextVerbosity(parsedArgs.textVerbosity ?? env.CLAUDE_CODEX_TEXT_VERBOSITY ?? 'low'),
         maxBodyBytes: parsePositiveInteger(parsedArgs.maxBodyBytes ?? env.CLAUDE_CODEX_MAX_BODY_BYTES ?? String(DEFAULT_MAX_BODY_BYTES), 'max body bytes'),
         websocketConnectTimeoutMs: parsePositiveInteger(

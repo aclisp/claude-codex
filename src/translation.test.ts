@@ -26,12 +26,36 @@ describe('Anthropic to Codex request translation', () => {
             tool_choice: 'auto',
             parallel_tool_calls: true,
             text: { verbosity: 'low' },
-            reasoning: { effort: 'high', summary: 'auto' },
+            reasoning: { effort: 'medium', summary: 'auto' },
         });
         expect(body.input).toEqual([
             {
                 role: 'user',
                 content: [{ type: 'input_text', text: 'Hello' }],
+            },
+        ]);
+    });
+
+    test('ignores Claude-side context management controls', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            context_management: {
+                edits: [
+                    {
+                        type: 'clear_tool_uses_20250919',
+                        trigger: { type: 'input_tokens', value: 100_000 },
+                        keep: { type: 'tool_uses', value: 3 },
+                    },
+                ],
+            },
+            messages: [{ role: 'user', content: 'x' }],
+        });
+
+        expect(body.input).toEqual([
+            {
+                role: 'user',
+                content: [{ type: 'input_text', text: 'x' }],
             },
         ]);
     });
@@ -57,6 +81,33 @@ describe('Anthropic to Codex request translation', () => {
                 messages: [{ role: 'user', content: 'x' }],
             }).instructions,
         ).toBe('first\n\nsecond');
+    });
+
+    test('folds system-role messages into instructions', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            system: 'top-level',
+            messages: [
+                { role: 'system', content: 'message-level' },
+                { role: 'user', content: 'x' },
+                {
+                    role: 'system',
+                    content: [
+                        { type: 'text', text: 'block one' },
+                        { type: 'text', text: 'block two' },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.instructions).toBe('top-level\n\nmessage-level\n\nblock one\n\nblock two');
+        expect(body.input).toEqual([
+            {
+                role: 'user',
+                content: [{ type: 'input_text', text: 'x' }],
+            },
+        ]);
     });
 
     test('translates base64 user images to Responses data URLs', () => {
@@ -294,6 +345,24 @@ describe('Anthropic to Codex request translation', () => {
                 messages: [{ role: 'user', content: 'x' }],
             }).reasoning?.effort,
         ).toBe('none');
+
+        expect(
+            translateAnthropicToCodex({
+                model: 'gpt-5.4-mini',
+                max_tokens: 128,
+                thinking: { type: 'adaptive' },
+                messages: [{ role: 'user', content: 'x' }],
+            }).reasoning?.effort,
+        ).toBe('medium');
+
+        expect(
+            translateAnthropicToCodex({
+                model: 'gpt-5.4-mini',
+                max_tokens: 128,
+                thinking: { type: 'adaptive', budget_tokens: 2_000 },
+                messages: [{ role: 'user', content: 'x' }],
+            }).reasoning?.effort,
+        ).toBe('low');
 
         expect(
             translateAnthropicToCodex(

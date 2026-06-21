@@ -20,11 +20,11 @@ export interface AnthropicMessageRequest {
 export type AnthropicSystemPrompt = string | AnthropicTextBlock[];
 
 export interface AnthropicMessage {
-    role: 'user' | 'assistant';
+    role: 'user' | 'assistant' | 'system';
     content: AnthropicMessageContent;
 }
 
-export type AnthropicMessageContent = string | AnthropicUserContentBlock[] | AnthropicAssistantContentBlock[];
+export type AnthropicMessageContent = string | AnthropicUserContentBlock[] | AnthropicAssistantContentBlock[] | AnthropicTextBlock[];
 
 export type AnthropicUserContentBlock = AnthropicTextBlock | AnthropicImageBlock | AnthropicToolResultBlock;
 export type AnthropicAssistantContentBlock = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinkingBlock | AnthropicToolUseBlock;
@@ -85,7 +85,7 @@ export interface AnthropicToolChoice {
 }
 
 export interface AnthropicThinkingConfig {
-    type: 'enabled' | 'disabled';
+    type: 'enabled' | 'disabled' | 'adaptive';
     budget_tokens?: number;
 }
 
@@ -101,7 +101,7 @@ export interface AnthropicOutputFormat {
     strict?: boolean;
 }
 
-const UNSUPPORTED_BEHAVIOR_FIELDS = ['container', 'context_management', 'mcp_servers', 'service_tier'] as const;
+const UNSUPPORTED_BEHAVIOR_FIELDS = ['container', 'mcp_servers', 'service_tier'] as const;
 
 export interface ParseAnthropicRequestOptions {
     requireMaxTokens?: boolean;
@@ -206,7 +206,7 @@ function parseMessages(value: unknown): AnthropicMessage[] {
     return value.map((message, index) => {
         const raw = expectRecord(message, `messages[${index}]`);
         const role = expectString(raw.role, `messages[${index}].role`);
-        if (role !== 'user' && role !== 'assistant') {
+        if (role !== 'user' && role !== 'assistant' && role !== 'system') {
             throw new ProxyValidationError(`Unsupported message role "${role}".`);
         }
 
@@ -217,13 +217,27 @@ function parseMessages(value: unknown): AnthropicMessage[] {
     });
 }
 
-function parseMessageContent(value: unknown, role: 'user' | 'assistant', messageIndex: number): AnthropicMessageContent {
+function parseMessageContent(value: unknown, role: 'user' | 'assistant' | 'system', messageIndex: number): AnthropicMessageContent {
     if (typeof value === 'string') {
         return value;
     }
 
     if (!Array.isArray(value)) {
         throw new ProxyValidationError(`messages[${messageIndex}].content must be a string or content block array.`);
+    }
+
+    if (role === 'system') {
+        return value.map((block, blockIndex) => {
+            const raw = expectRecord(block, `messages[${messageIndex}].content[${blockIndex}]`);
+            const type = expectString(raw.type, `messages[${messageIndex}].content[${blockIndex}].type`);
+            if (type !== 'text') {
+                throw new ProxyValidationError(`Unsupported system message block type "${type}" in v1.`);
+            }
+            return {
+                type: 'text',
+                text: expectString(raw.text, `messages[${messageIndex}].content[${blockIndex}].text`),
+            };
+        });
     }
 
     if (role === 'user') {
@@ -370,7 +384,7 @@ function parseToolChoice(value: unknown): AnthropicToolChoice {
 function parseThinking(value: unknown): AnthropicThinkingConfig {
     const raw = expectRecord(value, 'thinking');
     const type = expectString(raw.type, 'thinking.type');
-    if (type !== 'enabled' && type !== 'disabled') {
+    if (type !== 'enabled' && type !== 'disabled' && type !== 'adaptive') {
         throw new ProxyValidationError(`Unsupported thinking.type "${type}".`);
     }
 
