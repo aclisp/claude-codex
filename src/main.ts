@@ -13,9 +13,19 @@ if (config.debugBodiesPath) {
 const authReader = new CodexAuthReader(config.authPath);
 const codexClient = new CodexClient({
     baseUrl: config.codexBaseUrl,
+    upstreamProxyUrl: config.upstreamProxyUrl,
     authReader,
     websocketConnectTimeoutMs: config.websocketConnectTimeoutMs,
     upstreamIdleTimeoutMs: config.upstreamIdleTimeoutMs,
+    onTransportFallback(event) {
+        console.warn(
+            JSON.stringify({
+                at: new Date().toISOString(),
+                event: 'codex_transport_fallback',
+                ...event,
+            }),
+        );
+    },
 });
 const proxyServer = createProxyServer(config, {
     codexClient,

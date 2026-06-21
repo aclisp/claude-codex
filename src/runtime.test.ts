@@ -39,6 +39,26 @@ describe('Runtime config', () => {
     test('defaults Codex reasoning effort to medium', () => {
         expect(loadRuntimeConfig([], { HOME: '/tmp/test-home' }).defaultEffort).toBe('medium');
     });
+
+    test('resolves upstream proxy from HTTPS proxy env', () => {
+        const config = loadRuntimeConfig([], {
+            HOME: '/tmp/test-home',
+            https_proxy: 'http://127.0.0.1:7890',
+            http_proxy: 'http://127.0.0.1:8888',
+        });
+
+        expect(config.upstreamProxyUrl).toBe('http://127.0.0.1:7890/');
+    });
+
+    test('honors no_proxy for upstream proxy env', () => {
+        const config = loadRuntimeConfig([], {
+            HOME: '/tmp/test-home',
+            https_proxy: 'http://127.0.0.1:7890',
+            no_proxy: 'chatgpt.com',
+        });
+
+        expect(config.upstreamProxyUrl).toBeUndefined();
+    });
 });
 
 describe('Codex stream processing', () => {
@@ -395,6 +415,7 @@ describe('Codex transport', () => {
         const authPath = join(dir, 'auth.json');
         await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
         let fetchCalls = 0;
+        const fallbackEvents: unknown[] = [];
         const client = new CodexClient({
             baseUrl: 'https://chatgpt.com/backend-api',
             authReader: new CodexAuthReader(authPath),
@@ -404,6 +425,9 @@ describe('Codex transport', () => {
             fetchFn: async () => {
                 fetchCalls += 1;
                 return createSseResponse();
+            },
+            onTransportFallback(event) {
+                fallbackEvents.push(event);
             },
         });
         const body = buildCodexRequest({
@@ -417,6 +441,68 @@ describe('Codex transport', () => {
 
         expect(fetchCalls).toBe(1);
         expect(collectAnthropicMessage(events).content).toEqual([{ type: 'text', text: 'Hello from Codex' }]);
+        expect(fallbackEvents).toEqual([
+            {
+                sessionId: 'session-fallback',
+                from: 'websocket',
+                to: 'sse',
+                reason: 'connect failed',
+                sawWebSocketEvent: false,
+            },
+        ]);
+    });
+
+    test('passes Bun proxy option to SSE fetch', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-fetch-proxy-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        let capturedInit: RequestInit | undefined;
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            upstreamProxyUrl: 'http://127.0.0.1:7890/',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: null,
+            fetchFn: async (_input, init) => {
+                capturedInit = init;
+                return createSseResponse();
+            },
+        });
+        const body = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await collectAsync(client.stream(body, { sessionId: 'session-fetch-proxy' }).events);
+
+        expect((capturedInit as { proxy?: string }).proxy).toBe('http://127.0.0.1:7890/');
+    });
+
+    test('passes Bun proxy option to WebSocket constructor before SSE fallback', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-ws-proxy-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        FailingWebSocket.lastOptions = undefined;
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            upstreamProxyUrl: 'http://127.0.0.1:7890/',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: FailingWebSocket,
+            fetchFn: async () => createSseResponse(),
+        });
+        const body = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await collectAsync(client.stream(body, { sessionId: 'session-ws-proxy' }).events);
+
+        expect((FailingWebSocket.lastOptions as { proxy?: string }).proxy).toBe('http://127.0.0.1:7890/');
     });
 });
 
@@ -533,10 +619,13 @@ async function* asyncInternalIterable(events: InternalAssistantEvent[]): AsyncGe
 }
 
 class FailingWebSocket {
+    static lastOptions: unknown;
+
     readyState = 0;
     private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
 
-    constructor() {
+    constructor(_url?: string, options?: unknown) {
+        FailingWebSocket.lastOptions = options;
         setTimeout(() => {
             this.emit('error', { message: 'connect failed' });
         }, 0);

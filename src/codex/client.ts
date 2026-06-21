@@ -11,11 +11,13 @@ const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60_000;
 
 export interface CodexClientOptions {
     baseUrl: string;
+    upstreamProxyUrl?: string;
     authReader: CodexAuthReader;
     websocketConnectTimeoutMs: number;
     upstreamIdleTimeoutMs: number;
     fetchFn?: FetchLike;
     WebSocketCtor?: WebSocketConstructorLike | null;
+    onTransportFallback?: (event: CodexTransportFallbackEvent) => void;
 }
 
 export interface CodexStreamOptions {
@@ -26,6 +28,14 @@ export interface CodexStreamOptions {
 export interface CodexStreamResult {
     transport: 'websocket' | 'sse';
     events: AsyncIterable<InternalAssistantEvent>;
+}
+
+export interface CodexTransportFallbackEvent {
+    sessionId: string;
+    from: 'websocket';
+    to: 'sse';
+    reason: string;
+    sawWebSocketEvent: boolean;
 }
 
 type WebSocketEventType = 'open' | 'message' | 'error' | 'close';
@@ -41,6 +51,15 @@ interface WebSocketLike {
 
 type WebSocketConstructorLike = new (url: string, protocolsOrOptions?: unknown) => WebSocketLike;
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+interface BunRequestInit extends RequestInit {
+    proxy?: string;
+}
+
+interface BunWebSocketOptions {
+    headers: Record<string, string>;
+    proxy?: string;
+}
 
 interface CachedWebSocketContinuation {
     lastRequestBody: CodexResponsesRequest;
@@ -111,8 +130,16 @@ export class CodexClient {
         try {
             yield* websocketEvents;
         } catch (error) {
+            const sawEvent = sawWebSocketEvent();
             this.websocketFallbackSessions.add(options.sessionId);
-            if (sawWebSocketEvent()) {
+            this.options.onTransportFallback?.({
+                sessionId: options.sessionId,
+                from: 'websocket',
+                to: 'sse',
+                reason: describeError(error),
+                sawWebSocketEvent: sawEvent,
+            });
+            if (sawEvent) {
                 throw error;
             }
             yield* this.streamSse(body, options);
@@ -196,12 +223,17 @@ export class CodexClient {
         credentials: CodexCredentials,
         options: CodexStreamOptions,
     ): AsyncGenerator<Record<string, unknown>> {
-        const response = await this.fetchFn(resolveCodexUrl(this.options.baseUrl), {
+        const requestInit: BunRequestInit = {
             method: 'POST',
             headers: buildSseHeaders(credentials, options.sessionId),
             body: JSON.stringify(body),
             signal: options.signal,
-        });
+        };
+        if (this.options.upstreamProxyUrl) {
+            requestInit.proxy = this.options.upstreamProxyUrl;
+        }
+
+        const response = await this.fetchFn(resolveCodexUrl(this.options.baseUrl), requestInit);
 
         if (!response.ok) {
             throw await createCodexHttpError(response);
@@ -276,6 +308,10 @@ export class CodexClient {
         }
 
         const headers = headersToRecord(buildWebSocketHeaders(credentials, requestId));
+        const websocketOptions: BunWebSocketOptions = { headers };
+        if (this.options.upstreamProxyUrl) {
+            websocketOptions.proxy = this.options.upstreamProxyUrl;
+        }
         const WebSocketCtor = this.WebSocketCtor;
         return new Promise<WebSocketLike>((resolve, reject) => {
             let settled = false;
@@ -283,7 +319,7 @@ export class CodexClient {
             let socket: WebSocketLike;
 
             try {
-                socket = new WebSocketCtor(resolveCodexWebSocketUrl(this.options.baseUrl), { headers });
+                socket = new WebSocketCtor(resolveCodexWebSocketUrl(this.options.baseUrl), websocketOptions);
             } catch (error) {
                 reject(error instanceof Error ? error : new Error(String(error)));
                 return;
@@ -623,4 +659,11 @@ function extractWebSocketCloseError(event: unknown): Error {
     const codeText = typeof code === 'number' ? ` code ${code}` : '';
     const reasonText = typeof reason === 'string' && reason.length > 0 ? `: ${reason}` : '';
     return new Error(`WebSocket closed${codeText}${reasonText}.`);
+}
+
+function describeError(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message || error.name;
+    }
+    return String(error);
 }

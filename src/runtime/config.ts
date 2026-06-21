@@ -5,6 +5,7 @@ export interface ProxyRuntimeConfig {
     host: string;
     port: number;
     codexBaseUrl: string;
+    upstreamProxyUrl?: string;
     authPath: string;
     stateDir: string;
     defaultModel: CodexModelId;
@@ -29,10 +30,13 @@ export function loadRuntimeConfig(args: string[] = process.argv.slice(2), env: R
     const home = env.HOME ?? process.cwd();
     const codexHome = env.CODEX_HOME ?? `${home}/.codex`;
 
+    const codexBaseUrl = parsedArgs.codexBaseUrl ?? env.CODEX_BASE_URL ?? DEFAULT_CODEX_BASE_URL;
+
     return {
         host,
         port,
-        codexBaseUrl: parsedArgs.codexBaseUrl ?? env.CODEX_BASE_URL ?? DEFAULT_CODEX_BASE_URL,
+        codexBaseUrl,
+        upstreamProxyUrl: resolveHttpProxyUrlForTarget(codexBaseUrl, env),
         authPath: parsedArgs.authPath ?? env.CODEX_AUTH_PATH ?? `${codexHome}/auth.json`,
         stateDir: parsedArgs.stateDir ?? env.CLAUDE_CODEX_STATE_DIR ?? '.claude-codex',
         defaultModel: validateCodexModelId(parsedArgs.defaultModel ?? env.CLAUDE_CODEX_DEFAULT_MODEL ?? DEFAULT_CODEX_MODEL_ID),
@@ -107,4 +111,86 @@ function parseTextVerbosity(value: string): ProxyRuntimeConfig['textVerbosity'] 
         return value;
     }
     throw new ProxyValidationError('text verbosity must be one of low, medium, or high.');
+}
+
+const DEFAULT_UPSTREAM_PORTS: Record<string, number> = {
+    http: 80,
+    https: 443,
+    ws: 80,
+    wss: 443,
+};
+
+function resolveHttpProxyUrlForTarget(targetUrl: string, env: Record<string, string | undefined>): string | undefined {
+    const parsedTarget = parseUrl(targetUrl);
+    if (!parsedTarget) {
+        return undefined;
+    }
+
+    const protocol = parsedTarget.protocol.slice(0, -1);
+    const hostname = parsedTarget.hostname.toLowerCase();
+    const port = Number(parsedTarget.port) || DEFAULT_UPSTREAM_PORTS[protocol] || 0;
+    if (!shouldProxyHostname(hostname, port, env)) {
+        return undefined;
+    }
+
+    let proxy = getProxyEnv(`${protocol}_proxy`, env) || getProxyEnv('all_proxy', env);
+    if (!proxy) {
+        return undefined;
+    }
+    if (!proxy.includes('://')) {
+        proxy = `${protocol}://${proxy}`;
+    }
+
+    const parsedProxy = parseUrl(proxy);
+    if (!parsedProxy) {
+        throw new ProxyValidationError(`Invalid proxy URL "${proxy}".`);
+    }
+    if (parsedProxy.protocol !== 'http:' && parsedProxy.protocol !== 'https:') {
+        throw new ProxyValidationError(`Unsupported proxy protocol "${parsedProxy.protocol}". Use an HTTP or HTTPS proxy URL.`);
+    }
+    return parsedProxy.toString();
+}
+
+function getProxyEnv(key: string, env: Record<string, string | undefined>): string {
+    return env[key.toLowerCase()] ?? env[key.toUpperCase()] ?? '';
+}
+
+function shouldProxyHostname(hostname: string, port: number, env: Record<string, string | undefined>): boolean {
+    const noProxy = getProxyEnv('no_proxy', env).toLowerCase();
+    if (!noProxy) {
+        return true;
+    }
+    if (noProxy === '*') {
+        return false;
+    }
+
+    return noProxy.split(/[,\s]/).every((entry) => {
+        if (!entry) {
+            return true;
+        }
+
+        const parsedEntry = entry.match(/^(.+):(\d+)$/);
+        let entryHostname = parsedEntry?.[1] ?? entry;
+        const entryPort = parsedEntry ? Number.parseInt(parsedEntry[2] ?? '', 10) : 0;
+        if (entryPort && entryPort !== port) {
+            return true;
+        }
+
+        if (!/^[.*]/.test(entryHostname)) {
+            return hostname !== entryHostname;
+        }
+
+        if (entryHostname.startsWith('*')) {
+            entryHostname = entryHostname.slice(1);
+        }
+        return !hostname.endsWith(entryHostname);
+    });
+}
+
+function parseUrl(value: string): URL | undefined {
+    try {
+        return new URL(value);
+    } catch {
+        return undefined;
+    }
 }
