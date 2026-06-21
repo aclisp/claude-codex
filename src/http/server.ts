@@ -46,6 +46,7 @@ export function createProxyServer(config: ProxyRuntimeConfig, dependencies: Prox
         async fetch(request: Request): Promise<Response> {
             const startedAt = Date.now();
             const url = new URL(request.url);
+            const logContext: Record<string, unknown> = {};
 
             try {
                 if (request.method === 'GET' && url.pathname === '/v1/models') {
@@ -55,12 +56,16 @@ export function createProxyServer(config: ProxyRuntimeConfig, dependencies: Prox
                 }
 
                 if (request.method === 'POST' && url.pathname === '/v1/messages') {
-                    const response = await handleMessages(request, config, dependencies.codexClient, sessionStore, logger, startedAt);
+                    const session = await sessionStore.resolve(request.headers);
+                    logContext.sessionId = session.sessionId;
+                    const response = await handleMessages(request, config, dependencies.codexClient, session.sessionId, logger, startedAt);
                     return response;
                 }
 
                 if (request.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
-                    const response = await handleCountTokens(request, config, logger, startedAt);
+                    const session = await sessionStore.resolve(request.headers);
+                    logContext.sessionId = session.sessionId;
+                    const response = await handleCountTokens(request, config, logger, startedAt, session.sessionId);
                     return response;
                 }
 
@@ -76,6 +81,7 @@ export function createProxyServer(config: ProxyRuntimeConfig, dependencies: Prox
                 const response = jsonError(normalized);
                 logRequest(logger, startedAt, {
                     route: url.pathname,
+                    ...logContext,
                     status: response.status,
                     error: response.status,
                     errorType: normalized.errorType,
@@ -91,7 +97,7 @@ async function handleMessages(
     request: Request,
     config: ProxyRuntimeConfig,
     codexClient: CodexClient,
-    sessionStore: SessionStore,
+    sessionId: string,
     logger: ProxyLogger,
     startedAt: number,
 ): Promise<Response> {
@@ -99,17 +105,16 @@ async function handleMessages(
     await traceDebugBody(config, rawBody);
 
     const anthropicRequest = parseAnthropicRequest(rawBody);
-    const session = await sessionStore.resolve(request.headers);
     const codexBody = buildCodexRequest(anthropicRequest, {
         defaultModel: config.defaultModel,
         defaultEffort: config.defaultEffort,
-        promptCacheKey: clampPromptCacheKey(session.sessionId),
+        promptCacheKey: clampPromptCacheKey(sessionId),
         textVerbosity: config.textVerbosity,
     });
 
     const abortController = new AbortController();
     const result = codexClient.stream(codexBody, {
-        sessionId: session.sessionId,
+        sessionId,
         signal: abortController.signal,
     });
 
@@ -117,7 +122,7 @@ async function handleMessages(
         const response = await createStreamingResponse(result.events, abortController, logger, startedAt, {
             route: '/v1/messages',
             model: codexBody.model,
-            sessionId: session.sessionId,
+            sessionId,
             transport: result.transport,
         });
         return response;
@@ -131,7 +136,7 @@ async function handleMessages(
     logRequest(logger, startedAt, {
         route: '/v1/messages',
         model: codexBody.model,
-        sessionId: session.sessionId,
+        sessionId,
         transport: result.transport,
         status: 200,
         stopReason: message.stop_reason,
@@ -142,7 +147,7 @@ async function handleMessages(
     return jsonResponse(message);
 }
 
-async function handleCountTokens(request: Request, config: ProxyRuntimeConfig, logger: ProxyLogger, startedAt: number): Promise<Response> {
+async function handleCountTokens(request: Request, config: ProxyRuntimeConfig, logger: ProxyLogger, startedAt: number, sessionId: string): Promise<Response> {
     const rawBody = await readJsonBody(request, config.maxBodyBytes);
     await traceDebugBody(config, rawBody);
 
@@ -157,6 +162,7 @@ async function handleCountTokens(request: Request, config: ProxyRuntimeConfig, l
     logRequest(logger, startedAt, {
         route: '/v1/messages/count_tokens',
         model: codexBody.model,
+        sessionId,
         status: response.status,
         inputTokens,
     });
@@ -175,11 +181,29 @@ async function createStreamingResponse(
     try {
         first = await iterator.next();
     } catch (error) {
-        return jsonError(normalizeError(error));
+        const normalized = normalizeError(error);
+        const response = jsonError(normalized);
+        logRequest(logger, startedAt, {
+            ...logFields,
+            status: response.status,
+            error: response.status,
+            errorType: normalized.errorType,
+            errorMessage: normalized.message,
+        });
+        return response;
     }
 
     if (first.done) {
-        return jsonError(new ProxyError('Codex stream ended before producing a message.', { httpStatus: 502, errorType: 'api_error' }));
+        const error = new ProxyError('Codex stream ended before producing a message.', { httpStatus: 502, errorType: 'api_error' });
+        const response = jsonError(error);
+        logRequest(logger, startedAt, {
+            ...logFields,
+            status: response.status,
+            error: response.status,
+            errorType: error.errorType,
+            errorMessage: error.message,
+        });
+        return response;
     }
 
     const encoder = new TextEncoder();
@@ -190,6 +214,8 @@ async function createStreamingResponse(
             let inputTokens: number | undefined;
             let outputTokens: number | undefined;
             let cacheReadInputTokens: number | undefined;
+            let errorType: string | undefined;
+            let errorMessage: string | undefined;
             try {
                 enqueueEvent(controller, encoder, first.value);
                 let pendingNext = iterator.next();
@@ -213,12 +239,18 @@ async function createStreamingResponse(
                     enqueueEvent(controller, encoder, event);
                 }
             } catch (error) {
-                status = normalizeError(error).httpStatus;
-                enqueueError(controller, encoder, normalizeError(error));
+                const normalized = normalizeError(error);
+                status = normalized.httpStatus;
+                errorType = normalized.errorType;
+                errorMessage = normalized.message;
+                enqueueError(controller, encoder, normalized);
             } finally {
                 logRequest(logger, startedAt, {
                     ...logFields,
                     status,
+                    error: status >= 400 ? status : undefined,
+                    errorType,
+                    errorMessage,
                     stopReason,
                     inputTokens,
                     outputTokens,

@@ -2,6 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { shortHash } from '../runtime/id.ts';
 
+export const SESSION_STORE_MAX_RECORDS = 200;
+
 export interface SessionRecord {
     id: string;
     createdAt: number;
@@ -76,6 +78,7 @@ export class SessionStore {
                     this.records.set(record.fingerprint, record);
                 }
             }
+            this.records = recordsToMap(pruneSessionRecords(this.records.values()));
         } catch {
             this.records.clear();
         }
@@ -83,7 +86,7 @@ export class SessionStore {
 
     async save(): Promise<void> {
         await mkdir(dirname(this.statePath), { recursive: true });
-        const sessions = [...this.records.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt).slice(0, 200);
+        const sessions = pruneSessionRecords(this.records.values());
         await writeFile(
             this.statePath,
             `${JSON.stringify(
@@ -96,7 +99,7 @@ export class SessionStore {
             )}\n`,
             'utf8',
         );
-        this.records = new Map(sessions.map((record) => [record.fingerprint, record]));
+        this.records = recordsToMap(sessions);
     }
 }
 
@@ -126,4 +129,12 @@ function isSessionRecord(value: unknown): value is SessionRecord {
     return (
         typeof record.id === 'string' && typeof record.fingerprint === 'string' && typeof record.createdAt === 'number' && typeof record.lastSeenAt === 'number'
     );
+}
+
+function pruneSessionRecords(records: Iterable<SessionRecord>): SessionRecord[] {
+    return [...records].sort((a, b) => b.lastSeenAt - a.lastSeenAt).slice(0, SESSION_STORE_MAX_RECORDS);
+}
+
+function recordsToMap(records: Iterable<SessionRecord>): Map<string, SessionRecord> {
+    return new Map([...records].map((record) => [record.fingerprint, record]));
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ResponseReasoningItem } from 'openai/resources/responses/responses.js';
 import { collectAnthropicMessage } from './anthropic/response.ts';
@@ -12,7 +12,7 @@ import { createProxyServer } from './http/server.ts';
 import type { InternalAssistantEvent } from './protocol/events.ts';
 import { decodeReasoningSignature } from './reasoning/signature.ts';
 import { loadRuntimeConfig } from './runtime/config.ts';
-import { createSessionStore } from './sessions/store.ts';
+import { createSessionStore, SESSION_STORE_MAX_RECORDS } from './sessions/store.ts';
 
 describe('Codex auth reader', () => {
     test('reads file-backed Codex auth without requiring keyring access', async () => {
@@ -86,6 +86,35 @@ describe('Session store', () => {
 
         expect(legacyOnly.record.claudeHeader).toBeUndefined();
         expect(legacyOnly.record.fingerprint).toBe('fallback:/tmp/project:claude-code-test');
+    });
+
+    test('caps loaded and saved session records by recent use', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-session-cap-');
+        const stateDir = join(dir, '.claude-codex');
+        const sessionsPath = join(stateDir, 'sessions.json');
+        await mkdir(stateDir, { recursive: true });
+        const oversizedSessions = Array.from({ length: SESSION_STORE_MAX_RECORDS + 5 }, (_, index) => ({
+            id: `ccx_${index}`,
+            createdAt: index,
+            lastSeenAt: index,
+            fingerprint: `header:session-${index}`,
+            claudeHeader: `session-${index}`,
+        }));
+        await writeFile(
+            sessionsPath,
+            `${JSON.stringify({
+                version: 1,
+                sessions: oversizedSessions,
+            })}\n`,
+        );
+
+        const store = createSessionStore(stateDir);
+        await store.resolve(new Headers({ 'x-claude-code-session-id': 'fresh-session' }));
+
+        const persisted = JSON.parse(await readFile(sessionsPath, 'utf8')) as { sessions: Array<{ fingerprint: string }> };
+        expect(persisted.sessions).toHaveLength(SESSION_STORE_MAX_RECORDS);
+        expect(persisted.sessions[0]?.fingerprint).toBe('header:fresh-session');
+        expect(persisted.sessions.some((record) => record.fingerprint === 'header:session-0')).toBe(false);
     });
 });
 
@@ -359,7 +388,7 @@ describe('HTTP proxy server', () => {
         const response = await server.fetch(
             new Request('http://127.0.0.1/v1/messages', {
                 method: 'POST',
-                headers: { 'content-type': 'application/json' },
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-error' },
                 body: JSON.stringify({
                     model: 'gpt-5.4-mini',
                     max_tokens: 64,
@@ -376,6 +405,39 @@ describe('HTTP proxy server', () => {
             errorType: 'invalid_request_error',
             errorMessage: 'Unsupported message role "bad".',
         });
+        expect((logs.at(-1) as { sessionId?: string }).sessionId?.startsWith('ccx_')).toBe(true);
+    });
+
+    test('logs session context for streaming setup errors', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-stream-error-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex')], { HOME: dir }), {
+            codexClient: throwingCodexClient(new Error('upstream unavailable')),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-stream-error' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    stream: true,
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(500);
+        expect(logs.at(-1)).toMatchObject({
+            route: '/v1/messages',
+            status: 500,
+            error: 500,
+            errorType: 'api_error',
+            errorMessage: 'upstream unavailable',
+        });
+        expect((logs.at(-1) as { sessionId?: string }).sessionId?.startsWith('ccx_')).toBe(true);
     });
 
     test('handles /v1/messages/count_tokens without max_tokens', async () => {
@@ -415,6 +477,33 @@ describe('HTTP proxy server', () => {
         expect(response.status).toBe(200);
         const body = (await response.json()) as { input_tokens: number };
         expect(body.input_tokens).toBeGreaterThan(0);
+    });
+
+    test('logs session context for /v1/messages/count_tokens', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-count-log-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex')], { HOME: dir }), {
+            codexClient: fakeCodexClient([]),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages/count_tokens', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-count' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(logs.at(-1)).toMatchObject({
+            route: '/v1/messages/count_tokens',
+            status: 200,
+        });
+        expect((logs.at(-1) as { sessionId?: string }).sessionId?.startsWith('ccx_')).toBe(true);
     });
 
     test('streams Anthropic ping frames after message_start', async () => {
@@ -623,6 +712,17 @@ function fakeCodexClient(events: InternalAssistantEvent[]) {
     } as unknown as CodexClient;
 }
 
+function throwingCodexClient(error: Error) {
+    return {
+        stream() {
+            return {
+                transport: 'sse' as const,
+                events: createThrowingInternalIterable(error),
+            };
+        },
+    } as unknown as CodexClient;
+}
+
 function captureLogger(logs: Record<string, unknown>[]) {
     return {
         info(event: Record<string, unknown>) {
@@ -644,6 +744,18 @@ async function* asyncInternalIterable(events: InternalAssistantEvent[]): AsyncGe
     for (const event of events) {
         yield event;
     }
+}
+
+function createThrowingInternalIterable(error: Error): AsyncIterable<InternalAssistantEvent> {
+    return {
+        [Symbol.asyncIterator]() {
+            return {
+                async next(): Promise<IteratorResult<InternalAssistantEvent>> {
+                    throw error;
+                },
+            };
+        },
+    };
 }
 
 class FailingWebSocket {
