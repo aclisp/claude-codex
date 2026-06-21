@@ -23,6 +23,7 @@ const proxyServer = createProxyServer(config, {
 });
 
 const server = Bun.serve({
+    idleTimeout: 0,
     hostname: config.host,
     port: config.port,
     fetch: proxyServer.fetch,

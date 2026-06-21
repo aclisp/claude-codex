@@ -9,6 +9,7 @@ import { CodexClient } from './codex/client.ts';
 import { buildCodexRequest } from './codex/request.ts';
 import { mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
 import { createProxyServer } from './http/server.ts';
+import type { InternalAssistantEvent } from './protocol/events.ts';
 import { decodeReasoningSignature } from './reasoning/signature.ts';
 import { loadRuntimeConfig } from './runtime/config.ts';
 import { createSessionStore } from './sessions/store.ts';
@@ -299,6 +300,36 @@ describe('HTTP proxy server', () => {
         });
     });
 
+    test('logs validation error details for rejected requests', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-log-error-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex')], { HOME: dir }), {
+            codexClient: fakeCodexClient([]),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    messages: [{ role: 'bad', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(400);
+        expect(logs.at(-1)).toMatchObject({
+            route: '/v1/messages',
+            status: 400,
+            error: 400,
+            errorType: 'invalid_request_error',
+            errorMessage: 'Unsupported message role "bad".',
+        });
+    });
+
     test('handles /v1/messages/count_tokens without max_tokens', async () => {
         const { server } = await createTestServer();
         const response = await server.fetch(
@@ -467,7 +498,35 @@ async function collectAsync<T>(events: AsyncIterable<T>): Promise<T[]> {
     return result;
 }
 
+function fakeCodexClient(events: InternalAssistantEvent[]) {
+    return {
+        stream() {
+            return {
+                transport: 'sse' as const,
+                events: asyncInternalIterable(events),
+            };
+        },
+    } as unknown as CodexClient;
+}
+
+function captureLogger(logs: Record<string, unknown>[]) {
+    return {
+        info(event: Record<string, unknown>) {
+            logs.push(event);
+        },
+        error(event: Record<string, unknown>) {
+            logs.push(event);
+        },
+    };
+}
+
 async function* asyncIterable(events: Record<string, unknown>[]): AsyncGenerator<Record<string, unknown>> {
+    for (const event of events) {
+        yield event;
+    }
+}
+
+async function* asyncInternalIterable(events: InternalAssistantEvent[]): AsyncGenerator<InternalAssistantEvent> {
     for (const event of events) {
         yield event;
     }

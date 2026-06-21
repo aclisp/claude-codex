@@ -172,6 +172,36 @@ describe('Anthropic to Codex request translation', () => {
         ]);
     });
 
+    test('normalizes missing or malformed tool input schemas', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            tools: [{ name: 'missing_schema' }, { name: 'null_schema', input_schema: null }, { name: 'string_schema', input_schema: 'bad' }],
+            messages: [{ role: 'user', content: 'use tools' }],
+        });
+
+        expect(body.tools).toEqual([
+            {
+                type: 'function',
+                name: 'missing_schema',
+                parameters: { type: 'object', properties: {} },
+                strict: null,
+            },
+            {
+                type: 'function',
+                name: 'null_schema',
+                parameters: { type: 'object', properties: {} },
+                strict: null,
+            },
+            {
+                type: 'function',
+                name: 'string_schema',
+                parameters: { type: 'object', properties: {} },
+                strict: null,
+            },
+        ]);
+    });
+
     test('translates named tool choice to forced OpenAI function choice', () => {
         const body = translateAnthropicToCodex({
             model: 'gpt-5.4-mini',
@@ -411,15 +441,26 @@ describe('Anthropic to Codex request translation', () => {
         expect(countTranslatedTokens(body)).toBeGreaterThan(0);
     });
 
+    test('accepts stop sequences without forwarding them to Responses', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            stop_sequences: ['END'],
+            messages: [{ role: 'user', content: 'x' }],
+        });
+
+        expect('stop' in body).toBe(false);
+    });
+
     test('returns clear validation errors for unsupported request behavior', () => {
         expect(() =>
             translateAnthropicToCodex({
                 model: 'gpt-5.4-mini',
                 max_tokens: 128,
-                stop_sequences: ['END'],
+                stop_sequences: ['END', 123],
                 messages: [{ role: 'user', content: 'x' }],
             }),
-        ).toThrow('stop_sequences is unsupported in v1.');
+        ).toThrow('stop_sequences[1] must be a string.');
 
         expect(() =>
             translateAnthropicToCodex({

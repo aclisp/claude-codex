@@ -72,11 +72,14 @@ export function createProxyServer(config: ProxyRuntimeConfig, dependencies: Prox
                     new ProxyError(`Route ${request.method} ${url.pathname} is not implemented.`, { httpStatus: 404, errorType: 'invalid_request_error' }),
                 );
             } catch (error) {
-                const response = jsonError(normalizeError(error));
+                const normalized = normalizeError(error);
+                const response = jsonError(normalized);
                 logRequest(logger, startedAt, {
                     route: url.pathname,
                     status: response.status,
                     error: response.status,
+                    errorType: normalized.errorType,
+                    errorMessage: normalized.message,
                 });
                 return response;
             }

@@ -139,9 +139,6 @@ export function parseAnthropicRequest(input: unknown, options?: ParseAnthropicRe
     }
     if (raw.stop_sequences !== undefined) {
         request.stop_sequences = parseStringArray(raw.stop_sequences, 'stop_sequences');
-        if (request.stop_sequences.length > 0) {
-            throw new ProxyValidationError('stop_sequences is unsupported in v1.');
-        }
     }
     if (raw.top_p !== undefined) {
         request.top_p = expectFiniteNumber(raw.top_p, 'top_p');
@@ -360,13 +357,20 @@ function parseTools(value: unknown): AnthropicTool[] {
         const raw = expectRecord(tool, `tools[${index}]`);
         const parsed: AnthropicTool = {
             name: expectString(raw.name, `tools[${index}].name`),
-            input_schema: expectRecord(raw.input_schema, `tools[${index}].input_schema`),
+            input_schema: normalizeToolInputSchema(raw.input_schema),
         };
         if (raw.description !== undefined) {
             parsed.description = expectString(raw.description, `tools[${index}].description`);
         }
         return parsed;
     });
+}
+
+function normalizeToolInputSchema(value: unknown): Record<string, unknown> {
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+    }
+    return { type: 'object', properties: {} };
 }
 
 function parseToolChoice(value: unknown): AnthropicToolChoice {
