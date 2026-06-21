@@ -56,9 +56,8 @@ Do not silently ignore fields that could affect sampling, stopping, tool choice,
 - Keyring-backed Codex auth.
 - Public network serving.
 - Exact Anthropic prompt-cache semantics.
-- Exact Anthropic thinking-block compatibility.
+- Exact Anthropic thinking-block compatibility beyond the proxy-owned signature format already implemented for Claude Code continuity.
 - File/PDF/document inputs.
-- Named forced tool choice unless later proven necessary.
 
 ## Security Model
 
@@ -400,7 +399,7 @@ Do not invent Anthropic cache creation values. If a field is unavailable or not 
 
 ## Reasoning and Effort
 
-V1 uses Claude Code effort controls as a convenient way to set Codex reasoning effort. V1 does not expose Codex reasoning as Anthropic thinking blocks.
+V1 uses Claude Code effort controls to set Codex reasoning effort and also preserves proxy-owned reasoning signatures so Claude Code can continue conversations that include Anthropic `thinking` or `redacted_thinking` blocks.
 
 Control precedence:
 
@@ -408,7 +407,7 @@ Control precedence:
 2. `thinking`
 3. Proxy default
 
-Recommended mapping:
+Implemented mapping:
 
 - `low` -> Codex `low`
 - `medium` -> Codex `medium`
@@ -417,24 +416,29 @@ Recommended mapping:
 - `max` -> Codex `xhigh`
 - `thinking.type === "disabled"` -> Codex reasoning off/none if supported
 - `thinking.type === "enabled"` with only `budget_tokens` -> convert budget bands to effort levels, not exact token budgets
+- `thinking.type === "adaptive"` -> accepted and resolved through the same precedence rules
 
-V1 requests `reasoning.encrypted_content` upstream and may preserve Codex reasoning items internally for Responses continuity, but it suppresses Anthropic `thinking` and `redacted_thinking` blocks in responses.
+V1 requests `reasoning.encrypted_content` upstream, emits Anthropic `thinking` blocks in responses using proxy-owned signatures, and can replay incoming `thinking` and `redacted_thinking` blocks back into Responses reasoning items for continuation.
 
-V2 can evaluate reasoning-block compatibility if it can preserve Anthropic-like signature semantics honestly.
+This is a Claude Code compatibility mechanism, not a promise of exact Anthropic reasoning-block semantics for arbitrary clients.
 
 Claude Code ultracode mode receives no special proxy behavior. If it sends an API-visible `xhigh` signal, map that to Codex `xhigh`. Harness-level orchestration remains Claude Code's responsibility.
 
 ## Request Parameters
 
-Map only the safe common subset:
+Map only the safe common subset, biased toward live Codex-verified behavior over theoretical public Responses compatibility:
 
-- `max_tokens` -> Codex max output token option.
-- `temperature` -> Codex temperature option.
+- `max_tokens` -> required and validated on the Anthropic side, but intentionally not forwarded upstream because Codex Responses does not accept the corresponding public Responses field in this deployment.
+- `temperature` -> forwarded upstream.
 - `metadata` -> local only; do not send upstream.
-- `stop_sequences` -> unsupported in v1 if non-empty.
-- `top_p` and `top_k` -> unsupported in v1 if non-default.
+- `stop_sequences` -> accepted and validated as `string[]`, but intentionally not forwarded upstream.
+- `tool_choice.any` -> Responses `required`.
+- named `tool_choice` -> Responses `{ type: "function", name }`.
+- `tool_choice.disable_parallel_tool_use === true` -> Responses `parallel_tool_calls: false`.
+- user image blocks -> accepted for both base64 and URL sources, then translated to Responses `input_image`.
+- `top_p` and `top_k` -> unsupported in v1 unless left at Anthropic defaults.
 
-Return clear 400s for unsupported non-default parameters instead of silently changing behavior.
+Return clear 400s for unsupported or non-default parameters instead of silently changing behavior.
 
 ## Beta Headers
 

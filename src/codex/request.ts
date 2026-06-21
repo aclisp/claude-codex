@@ -40,7 +40,7 @@ export interface CodexResponsesRequest {
     include: ResponseCreateParamsStreaming['include'];
     text: ResponseTextConfig;
     tool_choice: CodexToolChoice;
-    parallel_tool_calls: true;
+    parallel_tool_calls: boolean;
     tools?: OpenAIResponseTool[];
     temperature?: number;
     reasoning?: {
@@ -116,7 +116,7 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
         include: ['reasoning.encrypted_content'],
         text: buildTextConfig(request, options?.textVerbosity ?? 'low'),
         tool_choice: toolChoice,
-        parallel_tool_calls: true,
+        parallel_tool_calls: request.tool_choice?.disable_parallel_tool_use !== true,
         reasoning: {
             effort,
             summary: 'auto',
@@ -302,7 +302,7 @@ function translateUserMessage(content: AnthropicMessageRequest['messages'][numbe
             pendingContent.push({
                 type: 'input_image',
                 detail: 'auto',
-                image_url: `data:${block.source.media_type};base64,${block.source.data}`,
+                image_url: block.source.type === 'base64' ? `data:${block.source.media_type};base64,${block.source.data}` : block.source.url,
             });
             continue;
         }

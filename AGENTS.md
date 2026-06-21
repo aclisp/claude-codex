@@ -1,7 +1,3 @@
-## Behavior
-
-Always create a step-by-step plan and pause for user confirmation before taking any action.
-
 ## Checks
 
 Use these commands for project validation:

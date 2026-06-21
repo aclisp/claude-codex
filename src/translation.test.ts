@@ -144,6 +144,32 @@ describe('Anthropic to Codex request translation', () => {
         ]);
     });
 
+    test('translates user image URLs to Responses image URLs', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: 'inspect' },
+                        { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.input).toEqual([
+            {
+                role: 'user',
+                content: [
+                    { type: 'input_text', text: 'inspect' },
+                    { type: 'input_image', detail: 'auto', image_url: 'https://example.com/cat.png' },
+                ],
+            },
+        ]);
+    });
+
     test('translates tool definitions to non-strict OpenAI function tools', () => {
         const body = translateAnthropicToCodex({
             model: 'gpt-5.4-mini',
@@ -230,6 +256,30 @@ describe('Anthropic to Codex request translation', () => {
         });
 
         expect(body.tool_choice).toEqual({ type: 'function', name: 'read_file' });
+        expect(body.parallel_tool_calls).toBe(true);
+    });
+
+    test('disables parallel tool calls when requested by Anthropic tool_choice', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            tool_choice: { type: 'tool', name: 'read_file', disable_parallel_tool_use: true },
+            tools: [
+                {
+                    name: 'read_file',
+                    description: 'Read a file',
+                    input_schema: {
+                        type: 'object',
+                        properties: { path: { type: 'string' } },
+                        required: ['path'],
+                    },
+                },
+            ],
+            messages: [{ role: 'user', content: 'read' }],
+        });
+
+        expect(body.tool_choice).toEqual({ type: 'function', name: 'read_file' });
+        expect(body.parallel_tool_calls).toBe(false);
     });
 
     test('replays assistant tool calls using encoded proxy ids', () => {

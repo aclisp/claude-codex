@@ -36,11 +36,7 @@ export interface AnthropicTextBlock {
 
 export interface AnthropicImageBlock {
     type: 'image';
-    source: {
-        type: 'base64';
-        media_type: string;
-        data: string;
-    };
+    source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string };
 }
 
 export interface AnthropicToolUseBlock {
@@ -89,6 +85,7 @@ export interface AnthropicTool {
 export interface AnthropicToolChoice {
     type: 'auto' | 'any' | 'none' | 'tool';
     name?: string;
+    disable_parallel_tool_use?: boolean;
 }
 
 export interface AnthropicThinkingConfig {
@@ -265,17 +262,26 @@ function parseUserContentBlock(value: unknown, messageIndex: number, blockIndex:
     if (type === 'image') {
         const source = expectRecord(raw.source, `messages[${messageIndex}].content[${blockIndex}].source`);
         const sourceType = expectString(source.type, `messages[${messageIndex}].content[${blockIndex}].source.type`);
-        if (sourceType !== 'base64') {
-            throw new ProxyValidationError('Only base64 user image blocks are supported in v1.');
+        if (sourceType === 'base64') {
+            return {
+                type: 'image',
+                source: {
+                    type: 'base64',
+                    media_type: expectString(source.media_type, `messages[${messageIndex}].content[${blockIndex}].source.media_type`),
+                    data: expectString(source.data, `messages[${messageIndex}].content[${blockIndex}].source.data`),
+                },
+            };
         }
-        return {
-            type: 'image',
-            source: {
-                type: 'base64',
-                media_type: expectString(source.media_type, `messages[${messageIndex}].content[${blockIndex}].source.media_type`),
-                data: expectString(source.data, `messages[${messageIndex}].content[${blockIndex}].source.data`),
-            },
-        };
+        if (sourceType === 'url') {
+            return {
+                type: 'image',
+                source: {
+                    type: 'url',
+                    url: expectString(source.url, `messages[${messageIndex}].content[${blockIndex}].source.url`),
+                },
+            };
+        }
+        throw new ProxyValidationError(`Unsupported user image source type "${sourceType}" in v1.`);
     }
 
     if (type === 'tool_result') {
@@ -373,11 +379,13 @@ function normalizeToolInputSchema(value: unknown): Record<string, unknown> {
 function parseToolChoice(value: unknown): AnthropicToolChoice {
     const raw = expectRecord(value, 'tool_choice');
     const type = expectString(raw.type, 'tool_choice.type');
+    const disableParallelToolUse =
+        raw.disable_parallel_tool_use !== undefined ? expectBoolean(raw.disable_parallel_tool_use, 'tool_choice.disable_parallel_tool_use') : undefined;
     if (type === 'auto' || type === 'any' || type === 'none') {
-        return { type };
+        return { type, disable_parallel_tool_use: disableParallelToolUse };
     }
     if (type === 'tool') {
-        return { type, name: expectNonEmptyString(raw.name, 'tool_choice.name') };
+        return { type, name: expectNonEmptyString(raw.name, 'tool_choice.name'), disable_parallel_tool_use: disableParallelToolUse };
     }
     throw new ProxyValidationError(`Unsupported tool_choice type "${type}".`);
 }
