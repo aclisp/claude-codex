@@ -105,12 +105,9 @@ export function createSessionStore(stateDir: string): SessionStore {
 }
 
 function findClaudeSessionHeader(headers: Headers): string | undefined {
-    const names = ['x-claude-session-id', 'anthropic-session-id', 'x-session-id', 'x-client-request-id', 'x-request-id'];
-    for (const name of names) {
-        const value = headers.get(name);
-        if (value && value.length > 0) {
-            return value;
-        }
+    const value = headers.get('x-claude-code-session-id');
+    if (value && value.length > 0) {
+        return value;
     }
     return undefined;
 }

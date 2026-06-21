@@ -83,7 +83,7 @@ describe('Anthropic to Codex request translation', () => {
         ).toBe('first\n\nsecond');
     });
 
-    test('folds system-role messages into instructions', () => {
+    test('translates system-role messages as developer input', () => {
         const body = translateAnthropicToCodex({
             model: 'gpt-5.4-mini',
             max_tokens: 128,
@@ -101,11 +101,19 @@ describe('Anthropic to Codex request translation', () => {
             ],
         });
 
-        expect(body.instructions).toBe('top-level\n\nmessage-level\n\nblock one\n\nblock two');
+        expect(body.instructions).toBe('top-level');
         expect(body.input).toEqual([
+            {
+                role: 'developer',
+                content: [{ type: 'input_text', text: 'message-level' }],
+            },
             {
                 role: 'user',
                 content: [{ type: 'input_text', text: 'x' }],
+            },
+            {
+                role: 'developer',
+                content: [{ type: 'input_text', text: 'block one\n\nblock two' }],
             },
         ]);
     });
@@ -337,6 +345,71 @@ describe('Anthropic to Codex request translation', () => {
                 type: 'function_call_output',
                 call_id: 'call_456',
                 output: 'line 1\nline 2',
+            },
+        ]);
+    });
+
+    test('stringifies unsupported tool result content blocks without throwing', () => {
+        const toolId = encodeToolId({ call: 'call_unsupported', item: 'fc_unsupported' });
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'tool_result',
+                            tool_use_id: toolId,
+                            content: [
+                                { type: 'text', text: 'visible output' },
+                                { type: 'thinking', thinking: 'hidden thought' },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.input).toEqual([
+            {
+                type: 'function_call_output',
+                call_id: 'call_unsupported',
+                output: 'visible output\n[unsupported content block omitted: thinking]',
+            },
+        ]);
+        expect(countTranslatedTokens(body)).toBeGreaterThan(0);
+    });
+
+    test('omits tool result images and malformed blocks with stable markers', () => {
+        const toolId = encodeToolId({ call: 'call_images', item: 'fc_images' });
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'tool_result',
+                            tool_use_id: toolId,
+                            content: [
+                                { type: 'text' },
+                                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc' } },
+                                { type: 'image', source: { type: 'url', url: 'https://example.invalid/a.png' } },
+                                { type: 'image' },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.input).toEqual([
+            {
+                type: 'function_call_output',
+                call_id: 'call_images',
+                output: '[unsupported content block omitted: text]\n[image omitted: image/png]\n[image omitted: url]\n[unsupported content block omitted: image]',
             },
         ]);
     });

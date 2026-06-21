@@ -11,6 +11,7 @@ import type {
     AnthropicSystemPrompt,
     AnthropicTool,
     AnthropicToolResultBlock,
+    AnthropicToolResultContentBlock,
     AnthropicUserContentBlock,
 } from '../anthropic/request.ts';
 import { parseAnthropicRequest } from '../anthropic/request.ts';
@@ -51,7 +52,7 @@ export interface CodexResponsesRequest {
 }
 
 interface CodexInputMessage {
-    role: 'user';
+    role: 'user' | 'developer';
     content: CodexInputContent[];
 }
 
@@ -231,13 +232,7 @@ export function systemPromptToInstructions(system: AnthropicSystemPrompt | undef
 }
 
 function buildInstructions(request: AnthropicMessageRequest): string {
-    const parts = [systemPromptToInstructions(request.system)];
-    for (const message of request.messages) {
-        if (message.role === 'system') {
-            parts.push(systemPromptToInstructions(message.content as AnthropicSystemPrompt));
-        }
-    }
-    return parts.filter((part) => part.length > 0).join('\n\n');
+    return systemPromptToInstructions(request.system);
 }
 
 function translateMessages(request: AnthropicMessageRequest): CodexInputItem[] {
@@ -245,6 +240,7 @@ function translateMessages(request: AnthropicMessageRequest): CodexInputItem[] {
 
     for (const [messageIndex, message] of request.messages.entries()) {
         if (message.role === 'system') {
+            input.push(...translateSystemMessage(message.content as AnthropicSystemPrompt));
             continue;
         }
         if (message.role === 'user') {
@@ -255,6 +251,19 @@ function translateMessages(request: AnthropicMessageRequest): CodexInputItem[] {
     }
 
     return input;
+}
+
+function translateSystemMessage(content: AnthropicSystemPrompt): CodexInputItem[] {
+    const text = systemPromptToInstructions(content);
+    if (text.length === 0) {
+        return [];
+    }
+    return [
+        {
+            role: 'developer',
+            content: [{ type: 'input_text', text }],
+        },
+    ];
 }
 
 function translateUserMessage(content: AnthropicMessageRequest['messages'][number]['content']): CodexInputItem[] {
@@ -376,7 +385,35 @@ function toolResultOutput(block: AnthropicToolResultBlock): string {
     if (typeof block.content === 'string') {
         return block.content;
     }
-    return block.content.map((item) => item.text).join('\n');
+    return block.content.map(toolResultContentBlockToString).join('\n');
+}
+
+function toolResultContentBlockToString(block: AnthropicToolResultContentBlock): string {
+    if (isToolResultTextBlock(block)) {
+        return block.text;
+    }
+    if (isToolResultImageBlock(block)) {
+        return `[image omitted: ${block.source.type === 'base64' ? block.source.media_type : 'url'}]`;
+    }
+    const type = typeof block.type === 'string' ? block.type : 'unknown';
+    return `[unsupported content block omitted: ${type}]`;
+}
+
+function isToolResultTextBlock(block: AnthropicToolResultContentBlock): block is AnthropicToolResultContentBlock & { type: 'text'; text: string } {
+    return block.type === 'text' && typeof block.text === 'string';
+}
+
+function isToolResultImageBlock(block: AnthropicToolResultContentBlock): block is AnthropicToolResultContentBlock & {
+    type: 'image';
+    source: { type: 'base64'; media_type: string } | { type: 'url' };
+} {
+    if (block.type !== 'image' || !isRecord(block.source)) {
+        return false;
+    }
+    if (block.source.type === 'url') {
+        return typeof block.source.url === 'string';
+    }
+    return block.source.type === 'base64' && typeof block.source.media_type === 'string' && typeof block.source.data === 'string';
 }
 
 function translateTools(tools: AnthropicTool[]): OpenAIResponseTool[] {

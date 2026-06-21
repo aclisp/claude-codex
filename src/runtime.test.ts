@@ -61,6 +61,34 @@ describe('Runtime config', () => {
     });
 });
 
+describe('Session store', () => {
+    test('uses only the documented Claude Code session header', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-session-');
+        const store = createSessionStore(join(dir, '.claude-codex'));
+
+        const resolved = await store.resolve(
+            new Headers({
+                'x-claude-code-session-id': 'new-session',
+                'x-claude-session-id': 'legacy-session',
+            }),
+        );
+
+        expect(resolved.record.claudeHeader).toBe('new-session');
+        expect(resolved.record.fingerprint).toBe('header:new-session');
+
+        const legacyOnly = await store.resolve(
+            new Headers({
+                'x-claude-session-id': 'legacy-session',
+                'x-claude-code-cwd': '/tmp/project',
+                'user-agent': 'claude-code-test',
+            }),
+        );
+
+        expect(legacyOnly.record.claudeHeader).toBeUndefined();
+        expect(legacyOnly.record.fingerprint).toBe('fallback:/tmp/project:claude-code-test');
+    });
+});
+
 describe('Codex stream processing', () => {
     test('maps raw Responses events to internal text events', async () => {
         const events = await collectAsync(
@@ -301,7 +329,7 @@ describe('HTTP proxy server', () => {
         const response = await server.fetch(
             new Request('http://127.0.0.1/v1/messages', {
                 method: 'POST',
-                headers: { 'content-type': 'application/json', 'x-claude-session-id': 'session-a' },
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-a' },
                 body: JSON.stringify({
                     model: 'gpt-5.4-mini',
                     max_tokens: 64,
@@ -394,7 +422,7 @@ describe('HTTP proxy server', () => {
         const response = await server.fetch(
             new Request('http://127.0.0.1/v1/messages', {
                 method: 'POST',
-                headers: { 'content-type': 'application/json', 'x-claude-session-id': 'session-stream' },
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-stream' },
                 body: JSON.stringify({
                     model: 'gpt-5.4-mini',
                     max_tokens: 64,

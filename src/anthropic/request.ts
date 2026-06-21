@@ -64,7 +64,7 @@ export interface AnthropicRedactedThinkingBlock {
 export interface AnthropicToolResultBlock {
     type: 'tool_result';
     tool_use_id: string;
-    content?: string | AnthropicToolResultTextBlock[];
+    content?: string | AnthropicToolResultContentBlock[];
     is_error?: boolean;
 }
 
@@ -72,6 +72,13 @@ export interface AnthropicToolResultTextBlock {
     type: 'text';
     text: string;
 }
+
+export interface AnthropicToolResultImageBlock {
+    type: 'image';
+    source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string };
+}
+
+export type AnthropicToolResultContentBlock = AnthropicToolResultTextBlock | AnthropicToolResultImageBlock | (Record<string, unknown> & { type?: unknown });
 
 export interface AnthropicTool {
     name: string;
@@ -326,7 +333,7 @@ function parseAssistantContentBlock(value: unknown, messageIndex: number, blockI
     throw new ProxyValidationError(`Unsupported assistant content block type "${type}" in v1.`);
 }
 
-function parseToolResultContent(value: unknown, messageIndex: number, blockIndex: number): string | AnthropicToolResultTextBlock[] {
+function parseToolResultContent(value: unknown, messageIndex: number, blockIndex: number): string | AnthropicToolResultContentBlock[] {
     if (typeof value === 'string') {
         return value;
     }
@@ -335,17 +342,7 @@ function parseToolResultContent(value: unknown, messageIndex: number, blockIndex
         throw new ProxyValidationError(`messages[${messageIndex}].content[${blockIndex}].content must be a string or text block array.`);
     }
 
-    return value.map((item, itemIndex) => {
-        const raw = expectRecord(item, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}]`);
-        const type = expectString(raw.type, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].type`);
-        if (type !== 'text') {
-            throw new ProxyValidationError('Tool-result images and non-text blocks are unsupported in v1.');
-        }
-        return {
-            type: 'text',
-            text: expectString(raw.text, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].text`),
-        };
-    });
+    return value.map((item, itemIndex) => expectRecord(item, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}]`));
 }
 
 function parseTools(value: unknown): AnthropicTool[] {
