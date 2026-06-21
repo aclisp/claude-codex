@@ -60,3 +60,23 @@ The proxy reads file-backed Codex auth from `auth.json` and never writes or refr
 - `gpt-5.4-mini` (default)
 
 See `doc/USAGE.md` for a fuller usage guide.
+
+## `~/.claude/settings.json`
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-abc",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4141",
+    "ANTHROPIC_MODEL": "gpt-5.4-mini",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.4-mini",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.4",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "gpt-5.5",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.4-mini",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1"
+  }
+}
+```
+
