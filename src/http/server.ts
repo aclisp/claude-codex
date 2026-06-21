@@ -6,6 +6,7 @@ import type { CodexClient } from '../codex/client.ts';
 import { countTranslatedTokens } from '../codex/count-tokens.ts';
 import { CODEX_MODEL_CATALOG } from '../codex/models.ts';
 import { buildCodexRequest } from '../codex/request.ts';
+import { formatLogEvent } from '../logging.ts';
 import { isProxyError, ProxyError, ProxyValidationError, toAnthropicErrorBody } from '../protocol/errors.ts';
 import type { InternalAssistantEvent } from '../protocol/events.ts';
 import type { ProxyRuntimeConfig } from '../runtime/config.ts';
@@ -19,6 +20,7 @@ export interface ProxyServerDependencies {
 
 export interface ProxyLogger {
     info(event: Record<string, unknown>): void;
+    warn(event: Record<string, unknown>): void;
     error(event: Record<string, unknown>): void;
 }
 
@@ -399,18 +401,35 @@ export function redactBody(value: unknown): unknown {
 }
 
 function logRequest(logger: ProxyLogger, startedAt: number, fields: Record<string, unknown>): void {
-    logger.info({
+    const event: Record<string, unknown> = {
         at: new Date().toISOString(),
         latencyMs: Date.now() - startedAt,
         ...fields,
-    });
+    };
+    const status = typeof event.status === 'number' ? event.status : undefined;
+    if (status !== undefined && status >= 500) {
+        logger.error(event);
+        return;
+    }
+    if (status !== undefined && status >= 400) {
+        logger.warn(event);
+        return;
+    }
+    if (event.error !== undefined) {
+        logger.error(event);
+        return;
+    }
+    logger.info(event);
 }
 
 const consoleLogger: ProxyLogger = {
     info(event) {
-        console.info(JSON.stringify(event));
+        console.info(formatLogEvent('info', event));
+    },
+    warn(event) {
+        console.warn(formatLogEvent('warn', event));
     },
     error(event) {
-        console.error(JSON.stringify(event));
+        console.error(formatLogEvent('error', event));
     },
 };

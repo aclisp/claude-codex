@@ -642,6 +642,7 @@ async function createTestServer() {
             sessionStore: createSessionStore(config.stateDir),
             logger: {
                 info() {},
+                warn() {},
                 error() {},
             },
         }),
@@ -726,6 +727,9 @@ function throwingCodexClient(error: Error) {
 function captureLogger(logs: Record<string, unknown>[]) {
     return {
         info(event: Record<string, unknown>) {
+            logs.push(event);
+        },
+        warn(event: Record<string, unknown>) {
             logs.push(event);
         },
         error(event: Record<string, unknown>) {
