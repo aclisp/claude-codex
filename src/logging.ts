@@ -39,6 +39,7 @@ function formatCompactFields(event: Record<string, unknown>): string[] {
         'status',
         'model',
         'sessionId',
+        'transport',
         'stopReason',
         'inputTokens',
         'outputTokens',
@@ -50,13 +51,13 @@ function formatCompactFields(event: Record<string, unknown>): string[] {
 
     for (const key of orderedKeys) {
         const value = event[key];
-        if (key !== 'at' && value !== undefined) {
+        if (value !== undefined) {
             fields.push(formatField(key, value));
         }
     }
 
     for (const [key, value] of Object.entries(event)) {
-        if (key === 'at' || orderedKeys.includes(key) || value === undefined) {
+        if (key === 'at' || key === 'latencyMs' || orderedKeys.includes(key) || value === undefined) {
             continue;
         }
         fields.push(formatField(key, value));
@@ -78,7 +79,9 @@ function formatField(key: string, value: unknown): string {
         case 'model':
             return colorize(formatScalar(value), CYAN);
         case 'sessionId':
-            return `${colorize('session=', MAGENTA)}${colorize(formatSessionId(value), MAGENTA)}`;
+            return `${colorize('session=', GRAY)}${colorize(formatSessionId(value), MAGENTA)}`;
+        case 'transport':
+            return colorize(formatScalar(value), MAGENTA);
         case 'stopReason':
             return colorize(formatScalar(value), GREEN);
         case 'inputTokens':
@@ -86,7 +89,7 @@ function formatField(key: string, value: unknown): string {
         case 'outputTokens':
             return `${colorize('output=', GRAY)}${colorize(String(value), tokenCountColor(value))}`;
         case 'cacheReadInputTokens':
-            return `${colorize('cacheRead=', GRAY)}${colorize(String(value), tokenCountColor(value))}`;
+            return `${colorize('cacheRead=', GRAY)}${colorize(String(value), CYAN)}`;
         case 'error':
             return `${colorize('err=', RED)}${colorize(formatScalar(value), RED)}`;
         case 'errorType':
