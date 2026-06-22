@@ -84,7 +84,7 @@ function formatField(key: string, value: unknown): string {
         case 'sessionId':
             return `${colorize('session=', GRAY)}${colorize(formatSessionId(value), MAGENTA)}`;
         case 'transport':
-            return colorize(formatScalar(value), MAGENTA);
+            return colorize(formatScalar(value), YELLOW);
         case 'stopReason':
             return colorize(formatScalar(value), GREEN);
         case 'inputTokens':
@@ -106,9 +106,9 @@ function formatField(key: string, value: unknown): string {
 
 function formatLatency(value: unknown): string {
     if (typeof value === 'number') {
-        return colorize(`${value}ms`, CYAN);
+        return colorize(`${(value / 1000).toFixed(1)}s`, GRAY);
     }
-    return `${colorize('latency=', CYAN)}${colorize(formatScalar(value), CYAN)}`;
+    return `${colorize('latency=', GRAY)}${colorize(formatScalar(value), GRAY)}`;
 }
 
 function formatScalar(value: unknown): string {
