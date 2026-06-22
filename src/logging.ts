@@ -19,17 +19,20 @@ export function colorize(value: string, color: string): string {
 }
 
 export function formatNotice(level: 'info' | 'warn' | 'error', message: string): string {
-    const label = level.toUpperCase();
-    const color = level === 'error' ? RED : level === 'warn' ? YELLOW : GREEN;
-    return `${colorize(label, `${BOLD}${color}`)} ${message}`;
+    const timestamp = colorize(formatLocalTimestamp(new Date()), GRAY);
+    return `${timestamp} ${formatLevelLabel(level)} ${message}`;
 }
 
 export function formatLogEvent(level: 'info' | 'warn' | 'error', event: Record<string, unknown>): string {
     const timestamp = colorize(formatLocalTimestamp(event.at), GRAY);
-    const label = colorize(level.toUpperCase(), `${BOLD}${level === 'error' ? RED : level === 'warn' ? YELLOW : GREEN}`);
     const fields = formatCompactFields(event);
 
-    return [timestamp, label, ...fields].join(' ');
+    return [timestamp, formatLevelLabel(level), ...fields].join(' ');
+}
+
+function formatLevelLabel(level: 'info' | 'warn' | 'error'): string {
+    const color = level === 'error' ? RED : level === 'warn' ? YELLOW : GREEN;
+    return colorize(level.toUpperCase(), `${BOLD}${color}`);
 }
 
 function formatCompactFields(event: Record<string, unknown>): string[] {
