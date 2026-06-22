@@ -35,7 +35,6 @@ export interface CodexTransportFallbackEvent {
     from: 'websocket';
     to: 'sse';
     reason: string;
-    sawWebSocketEvent: boolean;
 }
 
 type WebSocketEventType = 'open' | 'message' | 'error' | 'close';
@@ -137,7 +136,6 @@ export class CodexClient {
                 from: 'websocket',
                 to: 'sse',
                 reason: describeError(error),
-                sawWebSocketEvent: sawEvent,
             });
             if (sawEvent) {
                 throw error;

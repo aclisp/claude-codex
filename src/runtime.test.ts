@@ -564,7 +564,6 @@ describe('Codex transport', () => {
                 from: 'websocket',
                 to: 'sse',
                 reason: 'connect failed',
-                sawWebSocketEvent: false,
             },
         ]);
     });
