@@ -20,23 +20,148 @@ export function colorize(value: string, color: string): string {
 
 export function formatNotice(level: 'info' | 'warn' | 'error', message: string): string {
     const label = level.toUpperCase();
-    const color = level === 'error' ? RED : level === 'warn' ? YELLOW : CYAN;
+    const color = level === 'error' ? RED : level === 'warn' ? YELLOW : GREEN;
     return `${colorize(label, `${BOLD}${color}`)} ${message}`;
 }
 
 export function formatLogEvent(level: 'info' | 'warn' | 'error', event: Record<string, unknown>): string {
-    const timestamp = colorize(String(event.at ?? new Date().toISOString()), GRAY);
+    const timestamp = colorize(formatLocalTimestamp(event.at), GRAY);
     const label = colorize(level.toUpperCase(), `${BOLD}${level === 'error' ? RED : level === 'warn' ? YELLOW : GREEN}`);
-    const entries = Object.entries(event)
-        .filter(([key, value]) => key !== 'at' && value !== undefined)
-        .map(([key, value]) => formatField(key, value));
+    const fields = formatCompactFields(event);
 
-    return [timestamp, label, ...entries].join(' ');
+    return [timestamp, label, ...fields].join(' ');
+}
+
+function formatCompactFields(event: Record<string, unknown>): string[] {
+    const fields: string[] = [];
+    const orderedKeys: string[] = [
+        'route',
+        'status',
+        'model',
+        'sessionId',
+        'stopReason',
+        'inputTokens',
+        'outputTokens',
+        'cacheReadInputTokens',
+        'error',
+        'errorType',
+        'errorMessage',
+    ];
+
+    for (const key of orderedKeys) {
+        const value = event[key];
+        if (key !== 'at' && value !== undefined) {
+            fields.push(formatField(key, value));
+        }
+    }
+
+    for (const [key, value] of Object.entries(event)) {
+        if (key === 'at' || orderedKeys.includes(key) || value === undefined) {
+            continue;
+        }
+        fields.push(formatField(key, value));
+    }
+
+    if (event.latencyMs !== undefined) {
+        fields.push(formatLatency(event.latencyMs));
+    }
+
+    return fields;
 }
 
 function formatField(key: string, value: unknown): string {
-    const keyColor = key === 'status' ? statusColor(value) : key === 'route' ? BLUE : key === 'sessionId' ? MAGENTA : key === 'latencyMs' ? CYAN : GRAY;
-    return `${colorize(`${key}=`, keyColor)}${formatValue(key, value)}`;
+    switch (key) {
+        case 'route':
+            return colorize(formatScalar(value), BLUE);
+        case 'status':
+            return colorize(formatScalar(value), statusColor(value));
+        case 'model':
+            return colorize(formatScalar(value), CYAN);
+        case 'sessionId':
+            return `${colorize('session=', MAGENTA)}${colorize(formatSessionId(value), MAGENTA)}`;
+        case 'stopReason':
+            return colorize(formatScalar(value), GREEN);
+        case 'inputTokens':
+            return `${colorize('input=', GRAY)}${colorize(String(value), tokenCountColor(value))}`;
+        case 'outputTokens':
+            return `${colorize('output=', GRAY)}${colorize(String(value), tokenCountColor(value))}`;
+        case 'cacheReadInputTokens':
+            return `${colorize('cacheRead=', GRAY)}${colorize(String(value), tokenCountColor(value))}`;
+        case 'error':
+            return `${colorize('err=', RED)}${colorize(formatScalar(value), RED)}`;
+        case 'errorType':
+            return `${colorize('type=', RED)}${colorize(formatScalar(value), YELLOW)}`;
+        case 'errorMessage':
+            return `${colorize('msg=', RED)}${colorize(formatScalar(value), GRAY)}`;
+        default:
+            return `${colorize(`${key}=`, GRAY)}${colorize(formatScalar(value), valueColor(value))}`;
+    }
+}
+
+function formatLatency(value: unknown): string {
+    if (typeof value === 'number') {
+        return colorize(`${value}ms`, CYAN);
+    }
+    return `${colorize('latency=', CYAN)}${colorize(formatScalar(value), CYAN)}`;
+}
+
+function formatScalar(value: unknown): string {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return String(value);
+    }
+    if (value === null) {
+        return 'null';
+    }
+    return JSON.stringify(value);
+}
+
+function valueColor(value: unknown): string {
+    if (typeof value === 'number') {
+        return CYAN;
+    }
+    if (typeof value === 'boolean') {
+        return MAGENTA;
+    }
+    if (value === null) {
+        return GRAY;
+    }
+    return YELLOW;
+}
+
+function formatSessionId(value: unknown): string {
+    const text = typeof value === 'string' ? value : formatScalar(value);
+    const trimmed = text.replace(/^(?:ccx_|session[-_]|sid[-_])/, '');
+    if (trimmed.length <= 8) {
+        return trimmed;
+    }
+    return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+function formatLocalTimestamp(value: unknown): string {
+    const date = normalizeDate(value);
+    return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+
+function normalizeDate(value: unknown): Date {
+    if (value instanceof Date) {
+        return Number.isNaN(value.getTime()) ? new Date() : value;
+    }
+
+    if (typeof value === 'string' || typeof value === 'number') {
+        const date = new Date(value);
+        if (!Number.isNaN(date.getTime())) {
+            return date;
+        }
+    }
+
+    return new Date();
+}
+
+function pad2(value: number): string {
+    return String(value).padStart(2, '0');
 }
 
 function statusColor(value: unknown): string {
@@ -55,26 +180,10 @@ function statusColor(value: unknown): string {
     return GREEN;
 }
 
-function formatValue(key: string, value: unknown): string {
-    if (typeof value === 'string') {
-        return colorize(JSON.stringify(value), YELLOW);
+function tokenCountColor(value: unknown): string {
+    if (typeof value !== 'number') {
+        return CYAN;
     }
-    if (typeof value === 'number') {
-        if (key === 'inputTokens' || key === 'outputTokens') {
-            return colorize(String(value), tokenCountColor(value));
-        }
-        return colorize(String(value), CYAN);
-    }
-    if (typeof value === 'boolean') {
-        return colorize(String(value), MAGENTA);
-    }
-    if (value === null) {
-        return colorize('null', GRAY);
-    }
-    return colorize(JSON.stringify(value), GRAY);
-}
-
-function tokenCountColor(value: number): string {
     if (value > TOKEN_HIGHLIGHT_THRESHOLD) {
         return `${BOLD}${YELLOW}`;
     }
