@@ -8,6 +8,8 @@ import { CodexApiError, CodexProtocolError, mapRawCodexEvents, processCodexStrea
 import { resolveCodexUrl, resolveCodexWebSocketUrl } from './url.ts';
 
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60_000;
+const WEBSOCKET_FALLBACK_INITIAL_COOLDOWN_MS = 60_000;
+const WEBSOCKET_FALLBACK_MAX_COOLDOWN_MS = 10 * 60_000;
 
 export interface CodexClientOptions {
     baseUrl: string;
@@ -18,6 +20,9 @@ export interface CodexClientOptions {
     fetchFn?: FetchLike;
     WebSocketCtor?: WebSocketConstructorLike | null;
     onTransportFallback?: (event: CodexTransportFallbackEvent) => void;
+    websocketFallbackInitialCooldownMs?: number;
+    websocketFallbackMaxCooldownMs?: number;
+    nowFn?: () => number;
 }
 
 export interface CodexStreamOptions {
@@ -73,6 +78,11 @@ interface CachedWebSocketConnection {
     continuation?: CachedWebSocketContinuation;
 }
 
+interface WebSocketCooldown {
+    untilMs: number;
+    failures: number;
+}
+
 interface AcquiredWebSocket {
     socket: WebSocketLike;
     entry?: CachedWebSocketConnection;
@@ -83,7 +93,7 @@ export class CodexClient {
     private readonly fetchFn: FetchLike;
     private readonly WebSocketCtor: WebSocketConstructorLike | null;
     private readonly websocketCache = new Map<string, CachedWebSocketConnection>();
-    private readonly websocketFallbackSessions = new Set<string>();
+    private readonly websocketCooldowns = new Map<string, WebSocketCooldown>();
 
     constructor(private readonly options: CodexClientOptions) {
         this.fetchFn = options.fetchFn ?? fetch;
@@ -92,7 +102,7 @@ export class CodexClient {
     }
 
     stream(body: CodexResponsesRequest, options: CodexStreamOptions): CodexStreamResult {
-        if (this.websocketFallbackSessions.has(options.sessionId) || !this.WebSocketCtor) {
+        if (!this.WebSocketCtor || this.isWebSocketCooldownActive(options.sessionId)) {
             return {
                 transport: 'sse',
                 events: this.streamSse(body, options),
@@ -130,7 +140,7 @@ export class CodexClient {
             yield* websocketEvents;
         } catch (error) {
             const sawEvent = sawWebSocketEvent();
-            this.websocketFallbackSessions.add(options.sessionId);
+            this.rememberWebSocketFailure(options.sessionId);
             this.options.onTransportFallback?.({
                 sessionId: options.sessionId,
                 from: 'websocket',
@@ -183,12 +193,15 @@ export class CodexClient {
             );
             if (options.signal?.aborted) {
                 keepConnection = false;
-            } else if (acquired.entry && responseId) {
-                acquired.entry.continuation = {
-                    lastRequestBody: fullBody,
-                    lastResponseId: responseId,
-                    lastResponseItems: responseItems,
-                };
+            } else {
+                this.websocketCooldowns.delete(options.sessionId);
+                if (acquired.entry && responseId) {
+                    acquired.entry.continuation = {
+                        lastRequestBody: fullBody,
+                        lastResponseId: responseId,
+                        lastResponseItems: responseItems,
+                    };
+                }
             }
         } catch (error) {
             keepConnection = false;
@@ -383,6 +396,30 @@ export class CodexClient {
             closeWebSocketSilently(entry.socket, 1000, 'idle_timeout');
             this.websocketCache.delete(sessionId);
         }, SESSION_WEBSOCKET_CACHE_TTL_MS);
+    }
+
+    private isWebSocketCooldownActive(sessionId: string): boolean {
+        const cooldown = this.websocketCooldowns.get(sessionId);
+        if (!cooldown) {
+            return false;
+        }
+        return cooldown.untilMs > this.now();
+    }
+
+    private rememberWebSocketFailure(sessionId: string): void {
+        const previous = this.websocketCooldowns.get(sessionId);
+        const failures = (previous?.failures ?? 0) + 1;
+        const initialCooldownMs = this.options.websocketFallbackInitialCooldownMs ?? WEBSOCKET_FALLBACK_INITIAL_COOLDOWN_MS;
+        const maxCooldownMs = this.options.websocketFallbackMaxCooldownMs ?? WEBSOCKET_FALLBACK_MAX_COOLDOWN_MS;
+        const cooldownMs = Math.min(initialCooldownMs * 2 ** Math.max(0, failures - 1), maxCooldownMs);
+        this.websocketCooldowns.set(sessionId, {
+            failures,
+            untilMs: this.now() + cooldownMs,
+        });
+    }
+
+    private now(): number {
+        return this.options.nowFn?.() ?? Date.now();
     }
 }
 

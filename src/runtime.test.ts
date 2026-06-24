@@ -539,6 +539,7 @@ describe('Codex transport', () => {
             websocketConnectTimeoutMs: 50,
             upstreamIdleTimeoutMs: 0,
             WebSocketCtor: FailingWebSocket,
+            websocketFallbackInitialCooldownMs: 60_000,
             fetchFn: async () => {
                 fetchCalls += 1;
                 return createSseResponse();
@@ -564,6 +565,122 @@ describe('Codex transport', () => {
                 from: 'websocket',
                 to: 'sse',
                 reason: 'connect failed',
+            },
+        ]);
+    });
+
+    test('uses SSE during WebSocket fallback cooldown', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-fallback-cooldown-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        RecoveringWebSocket.reset(['fail-connect']);
+        let fetchCalls = 0;
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: RecoveringWebSocket,
+            websocketFallbackInitialCooldownMs: 60_000,
+            nowFn: () => 0,
+            fetchFn: async () => {
+                fetchCalls += 1;
+                return createSseResponse();
+            },
+        });
+        const body = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await collectAsync(client.stream(body, { sessionId: 'session-cooldown' }).events);
+        const second = client.stream(body, { sessionId: 'session-cooldown' });
+        await collectAsync(second.events);
+
+        expect(second.transport).toBe('sse');
+        expect(fetchCalls).toBe(2);
+        expect(RecoveringWebSocket.connectCount).toBe(1);
+    });
+
+    test('retries WebSocket after fallback cooldown expires', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-fallback-retry-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        let now = 0;
+        let fetchCalls = 0;
+        RecoveringWebSocket.reset(['fail-connect', 'success']);
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: RecoveringWebSocket,
+            websocketFallbackInitialCooldownMs: 1_000,
+            nowFn: () => now,
+            fetchFn: async () => {
+                fetchCalls += 1;
+                return createSseResponse();
+            },
+        });
+        const body = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await collectAsync(client.stream(body, { sessionId: 'session-retry' }).events);
+        now = 1_001;
+        const retry = client.stream(body, { sessionId: 'session-retry' });
+        const retryEvents = await collectAsync(retry.events);
+
+        expect(retry.transport).toBe('websocket');
+        expect(fetchCalls).toBe(1);
+        expect(RecoveringWebSocket.connectCount).toBe(2);
+        expect(collectAnthropicMessage(retryEvents).content).toEqual([{ type: 'text', text: 'Hello from WebSocket' }]);
+    });
+
+    test('does not replay through SSE when WebSocket fails after upstream events', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-fallback-partial-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        const fallbackEvents: unknown[] = [];
+        let fetchCalls = 0;
+        RecoveringWebSocket.reset(['partial-error']);
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: RecoveringWebSocket,
+            websocketFallbackInitialCooldownMs: 60_000,
+            nowFn: () => 0,
+            fetchFn: async () => {
+                fetchCalls += 1;
+                return createSseResponse();
+            },
+            onTransportFallback(event) {
+                fallbackEvents.push(event);
+            },
+        });
+        const body = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await expect(collectAsync(client.stream(body, { sessionId: 'session-partial' }).events)).rejects.toThrow('stream interrupted');
+        const next = client.stream(body, { sessionId: 'session-partial' });
+        await collectAsync(next.events);
+
+        expect(next.transport).toBe('sse');
+        expect(fetchCalls).toBe(1);
+        expect(fallbackEvents).toEqual([
+            {
+                sessionId: 'session-partial',
+                from: 'websocket',
+                to: 'sse',
+                reason: 'stream interrupted',
             },
         ]);
     });
@@ -648,30 +765,30 @@ async function createTestServer() {
     };
 }
 
-function createSseResponse(): Response {
-    const body = [
-        { type: 'response.created', response: { id: 'resp_test' } },
+function createTextResponseEvents(text: string, suffix: string): Record<string, unknown>[] {
+    return [
+        { type: 'response.created', response: { id: `resp_${suffix}` } },
         {
             type: 'response.output_item.added',
             output_index: 0,
-            item: { type: 'message', id: 'msg_upstream', role: 'assistant', status: 'in_progress', content: [] },
+            item: { type: 'message', id: `msg_${suffix}`, role: 'assistant', status: 'in_progress', content: [] },
         },
-        { type: 'response.output_text.delta', output_index: 0, item_id: 'msg_upstream', content_index: 0, delta: 'Hello from Codex' },
+        { type: 'response.output_text.delta', output_index: 0, item_id: `msg_${suffix}`, content_index: 0, delta: text },
         {
             type: 'response.output_item.done',
             output_index: 0,
             item: {
                 type: 'message',
-                id: 'msg_upstream',
+                id: `msg_${suffix}`,
                 role: 'assistant',
                 status: 'completed',
-                content: [{ type: 'output_text', text: 'Hello from Codex', annotations: [] }],
+                content: [{ type: 'output_text', text, annotations: [] }],
             },
         },
         {
             type: 'response.completed',
             response: {
-                id: 'resp_test',
+                id: `resp_${suffix}`,
                 status: 'completed',
                 output: [],
                 usage: {
@@ -683,7 +800,11 @@ function createSseResponse(): Response {
                 },
             },
         },
-    ]
+    ];
+}
+
+function createSseResponse(): Response {
+    const body = createTextResponseEvents('Hello from Codex', 'test')
         .map((event) => `data: ${JSON.stringify(event)}\n\n`)
         .join('');
 
@@ -775,6 +896,69 @@ class FailingWebSocket {
     }
 
     send(): void {}
+
+    close(): void {
+        this.readyState = 3;
+    }
+
+    addEventListener(type: string, listener: (event: unknown) => void): void {
+        const listeners = this.listeners.get(type) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+    }
+
+    removeEventListener(type: string, listener: (event: unknown) => void): void {
+        this.listeners.get(type)?.delete(listener);
+    }
+
+    private emit(type: string, event: unknown): void {
+        for (const listener of this.listeners.get(type) ?? []) {
+            listener(event);
+        }
+    }
+}
+
+type RecoveringWebSocketOutcome = 'fail-connect' | 'success' | 'partial-error';
+
+class RecoveringWebSocket {
+    static connectCount = 0;
+    private static outcomes: RecoveringWebSocketOutcome[] = [];
+
+    readyState = 0;
+    private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+    private readonly outcome: RecoveringWebSocketOutcome;
+
+    static reset(outcomes: RecoveringWebSocketOutcome[]): void {
+        RecoveringWebSocket.connectCount = 0;
+        RecoveringWebSocket.outcomes = [...outcomes];
+    }
+
+    constructor() {
+        RecoveringWebSocket.connectCount += 1;
+        this.outcome = RecoveringWebSocket.outcomes.shift() ?? 'success';
+        setTimeout(() => {
+            if (this.outcome === 'fail-connect') {
+                this.readyState = 3;
+                this.emit('error', { message: 'connect failed' });
+                return;
+            }
+            this.readyState = 1;
+            this.emit('open', {});
+        }, 0);
+    }
+
+    send(): void {
+        setTimeout(() => {
+            if (this.outcome === 'partial-error') {
+                this.emit('message', { data: JSON.stringify({ type: 'response.created', response: { id: 'resp_partial' } }) });
+                this.emit('error', { message: 'stream interrupted' });
+                return;
+            }
+            for (const event of createTextResponseEvents('Hello from WebSocket', 'ws')) {
+                this.emit('message', { data: JSON.stringify(event) });
+            }
+        }, 0);
+    }
 
     close(): void {
         this.readyState = 3;
