@@ -1,6 +1,7 @@
 import { ProxyError, ProxyValidationError } from '../protocol/errors.ts';
 import type { InternalAssistantEvent, InternalMessageEndEvent, InternalMessageStartEvent } from '../protocol/events.ts';
 import { type AnthropicUsage, toAnthropicUsage } from '../protocol/usage.ts';
+import type { AnthropicWebSearchResult, AnthropicWebSearchToolResultError } from './web-search.ts';
 
 export interface AnthropicMessageResponse {
     id: string;
@@ -13,7 +14,12 @@ export interface AnthropicMessageResponse {
     usage: AnthropicUsage;
 }
 
-export type AnthropicResponseContentBlock = AnthropicTextResponseBlock | AnthropicThinkingResponseBlock | AnthropicToolUseResponseBlock;
+export type AnthropicResponseContentBlock =
+    | AnthropicTextResponseBlock
+    | AnthropicThinkingResponseBlock
+    | AnthropicToolUseResponseBlock
+    | AnthropicServerToolUseResponseBlock
+    | AnthropicWebSearchToolResultResponseBlock;
 
 export interface AnthropicTextResponseBlock {
     type: 'text';
@@ -31,6 +37,19 @@ export interface AnthropicThinkingResponseBlock {
     type: 'thinking';
     thinking: string;
     signature: string;
+}
+
+export interface AnthropicServerToolUseResponseBlock {
+    type: 'server_tool_use';
+    id: string;
+    name: 'web_search';
+    input: { query: string };
+}
+
+export interface AnthropicWebSearchToolResultResponseBlock {
+    type: 'web_search_tool_result';
+    tool_use_id: string;
+    content: AnthropicWebSearchResult[] | AnthropicWebSearchToolResultError;
 }
 
 export function collectAnthropicMessage(events: Iterable<InternalAssistantEvent>): AnthropicMessageResponse {
@@ -94,6 +113,19 @@ export function collectAnthropicMessage(events: Iterable<InternalAssistantEvent>
             block.id = event.id;
             block.name = event.name;
             block.input = event.input;
+        } else if (event.type === 'server_tool_use') {
+            setContentBlock(content, event.index, {
+                type: 'server_tool_use',
+                id: event.id,
+                name: event.name,
+                input: event.input,
+            });
+        } else if (event.type === 'web_search_tool_result') {
+            setContentBlock(content, event.index, {
+                type: 'web_search_tool_result',
+                tool_use_id: event.toolUseId,
+                content: event.content,
+            });
         } else if (event.type === 'message_end') {
             end = event;
         }

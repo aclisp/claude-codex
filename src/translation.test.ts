@@ -3,6 +3,7 @@ import { collectAnthropicMessage } from './anthropic/response.ts';
 import { encodeAnthropicSse, toAnthropicSseFrames } from './anthropic/sse.ts';
 import { countTranslatedTokens } from './codex/count-tokens.ts';
 import { translateAnthropicToCodex } from './codex/request.ts';
+import { mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
 import { redactBody } from './http/server.ts';
 import { ProxyValidationError } from './protocol/errors.ts';
 import type { InternalAssistantEvent } from './protocol/events.ts';
@@ -236,6 +237,76 @@ describe('Anthropic to Codex request translation', () => {
         ]);
     });
 
+    test('translates basic hosted web search tools to OpenAI web_search', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            tools: [
+                {
+                    type: 'web_search_20250305',
+                    name: 'web_search',
+                    max_uses: 3,
+                    allowed_domains: ['openai.com'],
+                    blocked_domains: ['example.com'],
+                    user_location: {
+                        type: 'approximate',
+                        city: 'San Francisco',
+                        region: 'California',
+                        country: 'US',
+                        timezone: 'America/Los_Angeles',
+                    },
+                },
+            ],
+            messages: [{ role: 'user', content: 'search' }],
+        });
+
+        expect(body.tools as unknown).toEqual([
+            {
+                type: 'web_search',
+                external_web_access: false,
+                search_content_types: ['text', 'image'],
+                filters: {
+                    allowed_domains: ['openai.com'],
+                    blocked_domains: ['example.com'],
+                },
+                user_location: {
+                    type: 'approximate',
+                    city: 'San Francisco',
+                    region: 'California',
+                    country: 'US',
+                    timezone: 'America/Los_Angeles',
+                },
+            },
+        ]);
+        expect(JSON.stringify(body.tools)).not.toContain('max_uses');
+        expect(countTranslatedTokens(body)).toBeGreaterThan(0);
+    });
+
+    test('translates named web search tool choice to required hosted tool choice', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            tool_choice: { type: 'tool', name: 'web_search' },
+            tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+            messages: [{ role: 'user', content: 'search' }],
+        });
+
+        expect(body.tool_choice).toEqual({
+            type: 'web_search',
+        });
+    });
+
+    test('rejects unsupported hosted web search variants', () => {
+        expect(() =>
+            translateAnthropicToCodex({
+                model: 'gpt-5.4-mini',
+                max_tokens: 128,
+                tools: [{ type: 'web_search_20260318', name: 'web_search' }],
+                messages: [{ role: 'user', content: 'search' }],
+            }),
+        ).toThrow('Unsupported hosted web search tool type "web_search_20260318". Only web_search_20250305 is supported.');
+    });
+
     test('translates named tool choice to forced OpenAI function choice', () => {
         const body = translateAnthropicToCodex({
             model: 'gpt-5.4-mini',
@@ -464,6 +535,37 @@ describe('Anthropic to Codex request translation', () => {
         ]);
     });
 
+    test('drops replayed hosted web search server blocks', () => {
+        const body = translateAnthropicToCodex({
+            model: 'gpt-5.4-mini',
+            max_tokens: 128,
+            messages: [
+                {
+                    role: 'assistant',
+                    content: [
+                        { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'latest news' } },
+                        {
+                            type: 'web_search_tool_result',
+                            tool_use_id: 'srvtoolu_1',
+                            content: [{ type: 'web_search_result', title: 'Example', url: 'https://example.com' }],
+                        },
+                        { type: 'text', text: 'Result summary.' },
+                    ],
+                },
+            ],
+        });
+
+        expect(body.input).toEqual([
+            {
+                type: 'message',
+                role: 'assistant',
+                id: 'msg_ccx_replay_0_2',
+                status: 'completed',
+                content: [{ type: 'output_text', text: 'Result summary.', annotations: [] }],
+            },
+        ]);
+    });
+
     test('rejects malformed proxy tool ids', () => {
         expect(() =>
             translateAnthropicToCodex({
@@ -597,6 +699,100 @@ describe('Anthropic to Codex request translation', () => {
 });
 
 describe('Anthropic response encoding', () => {
+    test('maps OpenAI web search calls to Anthropic server tool blocks and usage', async () => {
+        const events = await collectAsync(
+            processCodexStream(
+                mapRawCodexEvents(
+                    asyncIterable([
+                        { type: 'response.created', response: { id: 'resp_search' } },
+                        {
+                            type: 'response.output_item.added',
+                            output_index: 0,
+                            item: { type: 'web_search_call', id: 'ws_1', status: 'in_progress', action: { type: 'search', query: 'latest news' } },
+                        },
+                        { type: 'response.web_search_call.searching', output_index: 0, item_id: 'ws_1' },
+                        { type: 'response.web_search_call.completed', output_index: 0, item_id: 'ws_1' },
+                        {
+                            type: 'response.output_item.done',
+                            output_index: 0,
+                            item: {
+                                type: 'web_search_call',
+                                id: 'ws_1',
+                                status: 'completed',
+                                action: { type: 'search', query: 'claude-code-proxy github', queries: ['claude-code-proxy github'] },
+                            },
+                        },
+                        {
+                            type: 'response.output_item.added',
+                            output_index: 1,
+                            item: { type: 'message', id: 'msg_1', role: 'assistant', status: 'in_progress', content: [] },
+                        },
+                        {
+                            type: 'response.output_text.delta',
+                            output_index: 1,
+                            item_id: 'msg_1',
+                            content_index: 0,
+                            delta: '1. **TechRadar security article** - warns about malware.\n   https://www.techradar.com/pro/security/example',
+                        },
+                        {
+                            type: 'response.output_item.done',
+                            output_index: 1,
+                            item: {
+                                type: 'message',
+                                id: 'msg_1',
+                                role: 'assistant',
+                                status: 'completed',
+                                content: [
+                                    {
+                                        type: 'output_text',
+                                        text: '1. **TechRadar security article** - warns about malware.\n   https://www.techradar.com/pro/security/example',
+                                        annotations: [],
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            type: 'response.completed',
+                            response: {
+                                id: 'resp_search',
+                                status: 'completed',
+                                output: [],
+                                usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+                            },
+                        },
+                    ]),
+                ),
+                { model: 'gpt-5.4-mini' },
+            ),
+        );
+
+        const message = collectAnthropicMessage(events);
+        expect(message.content).toEqual([
+            {
+                type: 'server_tool_use',
+                id: 'srvtoolu_ws_1',
+                name: 'web_search',
+                input: { query: 'claude-code-proxy github' },
+            },
+            {
+                type: 'web_search_tool_result',
+                tool_use_id: 'srvtoolu_ws_1',
+                content: [
+                    {
+                        type: 'web_search_result',
+                        title: 'TechRadar security article',
+                        url: 'https://www.techradar.com/pro/security/example',
+                    },
+                ],
+            },
+            {
+                type: 'text',
+                text: '1. **TechRadar security article** - warns about malware.\n   https://www.techradar.com/pro/security/example',
+            },
+        ]);
+        expect(message.usage.server_tool_use).toEqual({ web_search_requests: 1 });
+    });
+
     test('encodes internal text events to Anthropic SSE frames', () => {
         const events: InternalAssistantEvent[] = [
             { type: 'message_start', messageId: 'msg_ccx_1', model: 'gpt-5.4-mini', createdAt: 1, initialUsage: { inputTokens: 3 } },
@@ -731,3 +927,17 @@ describe('Anthropic response encoding', () => {
         });
     });
 });
+
+async function collectAsync<T>(events: AsyncIterable<T>): Promise<T[]> {
+    const result: T[] = [];
+    for await (const event of events) {
+        result.push(event);
+    }
+    return result;
+}
+
+async function* asyncIterable(events: Record<string, unknown>[]): AsyncGenerator<Record<string, unknown>> {
+    for (const event of events) {
+        yield event;
+    }
+}

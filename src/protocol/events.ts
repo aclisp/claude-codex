@@ -1,3 +1,4 @@
+import type { AnthropicWebSearchResult, AnthropicWebSearchToolResultError } from '../anthropic/web-search.ts';
 import type { AnthropicErrorType } from './errors.ts';
 import type { InternalUsage } from './usage.ts';
 
@@ -13,6 +14,8 @@ export type InternalAssistantEvent =
     | InternalToolStartEvent
     | InternalToolInputDeltaEvent
     | InternalToolEndEvent
+    | InternalServerToolUseEvent
+    | InternalWebSearchToolResultEvent
     | InternalPingEvent
     | InternalMessageEndEvent
     | InternalErrorEvent;
@@ -85,6 +88,21 @@ export interface InternalToolEndEvent {
     id: string;
     name: string;
     input: Record<string, unknown>;
+}
+
+export interface InternalServerToolUseEvent {
+    type: 'server_tool_use';
+    index: number;
+    id: string;
+    name: 'web_search';
+    input: { query: string };
+}
+
+export interface InternalWebSearchToolResultEvent {
+    type: 'web_search_tool_result';
+    index: number;
+    toolUseId: string;
+    content: AnthropicWebSearchResult[] | AnthropicWebSearchToolResultError;
 }
 
 export interface InternalPingEvent {

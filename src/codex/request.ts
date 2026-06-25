@@ -7,14 +7,16 @@ import type {
 } from 'openai/resources/responses/responses.js';
 import type {
     AnthropicAssistantContentBlock,
+    AnthropicFunctionTool,
     AnthropicMessageRequest,
     AnthropicSystemPrompt,
     AnthropicTool,
     AnthropicToolResultBlock,
     AnthropicToolResultContentBlock,
     AnthropicUserContentBlock,
+    AnthropicWebSearchTool,
 } from '../anthropic/request.ts';
-import { parseAnthropicRequest } from '../anthropic/request.ts';
+import { isAnthropicWebSearchTool, parseAnthropicRequest } from '../anthropic/request.ts';
 import { ProxyValidationError } from '../protocol/errors.ts';
 import { decodeReasoningSignature } from '../reasoning/signature.ts';
 import { decodeToolId } from '../tools/tool-id.ts';
@@ -22,7 +24,7 @@ import { type CodexModelId, DEFAULT_CODEX_MODEL_ID, validateCodexModelId } from 
 
 export type CodexReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 export type CodexTextVerbosity = 'low' | 'medium' | 'high';
-type CodexToolChoice = NonNullable<ResponseCreateParamsStreaming['tool_choice']>;
+type CodexToolChoice = NonNullable<ResponseCreateParamsStreaming['tool_choice']> | { type: 'web_search' };
 
 export interface BuildCodexRequestOptions {
     defaultModel?: CodexModelId;
@@ -103,7 +105,7 @@ export function translateAnthropicToCodex(input: unknown, options?: BuildCodexRe
 
 export function buildCodexRequest(request: AnthropicMessageRequest, options?: BuildCodexRequestOptions): CodexResponsesRequest {
     const model = validateCodexModelId(request.model ?? options?.defaultModel ?? DEFAULT_CODEX_MODEL_ID);
-    const toolChoice = mapToolChoice(request.tool_choice);
+    const toolChoice = mapToolChoice(request.tool_choice, request.tools);
     const translatedInput = translateMessages(request);
     const effort = resolveReasoningEffort(request, options?.defaultEffort ?? 'medium');
 
@@ -136,7 +138,7 @@ export function buildCodexRequest(request: AnthropicMessageRequest, options?: Bu
     return body;
 }
 
-export function mapToolChoice(choice: AnthropicMessageRequest['tool_choice']): CodexToolChoice {
+export function mapToolChoice(choice: AnthropicMessageRequest['tool_choice'], tools?: AnthropicTool[]): CodexToolChoice {
     if (choice === undefined || choice.type === 'auto') {
         return 'auto';
     }
@@ -148,6 +150,9 @@ export function mapToolChoice(choice: AnthropicMessageRequest['tool_choice']): C
     }
     if (!choice.name) {
         throw new ProxyValidationError('tool_choice.name is required when tool_choice.type is "tool".');
+    }
+    if (tools?.some((tool) => isAnthropicWebSearchTool(tool) && tool.name === choice.name)) {
+        return { type: 'web_search' };
     }
     return { type: 'function', name: choice.name };
 }
@@ -320,18 +325,21 @@ function translateAssistantMessage(content: AnthropicMessageRequest['messages'][
         return [createAssistantTextItem(content, messageIndex, 0)];
     }
 
-    return (content as AnthropicAssistantContentBlock[]).map((block, blockIndex) => {
+    return (content as AnthropicAssistantContentBlock[]).flatMap((block, blockIndex): CodexInputItem[] => {
         if (block.type === 'text') {
-            return createAssistantTextItem(block.text, messageIndex, blockIndex);
+            return [createAssistantTextItem(block.text, messageIndex, blockIndex)];
         }
         if (block.type === 'thinking') {
-            return decodeReasoningSignature(block.signature);
+            return [decodeReasoningSignature(block.signature)];
         }
         if (block.type === 'redacted_thinking') {
-            return decodeReasoningSignature(block.data);
+            return [decodeReasoningSignature(block.data)];
+        }
+        if (block.type === 'server_tool_use' || block.type === 'web_search_tool_result') {
+            return [];
         }
 
-        return translateToolUse(block);
+        return [translateToolUse(block)];
     });
 }
 
@@ -417,16 +425,39 @@ function isToolResultImageBlock(block: AnthropicToolResultContentBlock): block i
 }
 
 function translateTools(tools: AnthropicTool[]): OpenAIResponseTool[] {
-    return tools.map(
-        (tool) =>
-            ({
-                type: 'function',
-                name: tool.name,
-                description: tool.description,
-                parameters: tool.input_schema,
-                strict: null,
-            }) as OpenAIResponseTool,
-    );
+    return tools.map((tool) => (isAnthropicWebSearchTool(tool) ? translateWebSearchTool(tool) : translateFunctionTool(tool)));
+}
+
+function translateFunctionTool(tool: AnthropicFunctionTool): OpenAIResponseTool {
+    return {
+        type: 'function',
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+        strict: null,
+    } as OpenAIResponseTool;
+}
+
+function translateWebSearchTool(tool: AnthropicWebSearchTool): OpenAIResponseTool {
+    const translated: Record<string, unknown> = {
+        type: 'web_search',
+        external_web_access: false,
+        search_content_types: ['text', 'image'],
+    };
+    const filters: Record<string, unknown> = {};
+    if (tool.allowed_domains !== undefined && tool.allowed_domains.length > 0) {
+        filters.allowed_domains = tool.allowed_domains;
+    }
+    if (tool.blocked_domains !== undefined && tool.blocked_domains.length > 0) {
+        filters.blocked_domains = tool.blocked_domains;
+    }
+    if (Object.keys(filters).length > 0) {
+        translated.filters = filters;
+    }
+    if (tool.user_location !== undefined) {
+        translated.user_location = tool.user_location;
+    }
+    return translated as unknown as OpenAIResponseTool;
 }
 
 function normalizeEffort(value: string, field: string): CodexReasoningEffort {

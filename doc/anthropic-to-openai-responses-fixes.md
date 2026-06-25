@@ -22,6 +22,13 @@ runtime.
   `parallel_tool_calls: false`.
 - Missing, `null`, or malformed `tools[].input_schema` is normalized to
   `{ type: "object", properties: {} }`.
+- Basic hosted web search tools, `web_search_20250305`, map to Responses
+  hosted `web_search`. Non-empty domain filters and approximate
+  `user_location` are forwarded. `max_uses` is accepted and validated but not
+  forwarded because Responses has no search-count cap equivalent.
+- Completed Codex web-search calls emit Anthropic `server_tool_use` and
+  `web_search_tool_result` blocks, with
+  `usage.server_tool_use.web_search_requests`.
 - `output_config.format` with `json_schema` maps to Responses `text.format`,
   with strict schema normalization.
 - `thinking.type: "adaptive"` is accepted.
@@ -44,5 +51,6 @@ runtime.
 
 ## Intentionally Deferred
 
-- Hosted web search tools such as `web_search_20250305`.
+- Newer hosted web search variants beyond basic `web_search_20250305`,
+  including dynamic filtering and response-inclusion controls.
 - `service_tier` passthrough.

@@ -144,6 +144,62 @@ export function toAnthropicSseFrames(events: Iterable<InternalAssistantEvent>): 
                     index: event.index,
                 },
             });
+        } else if (event.type === 'server_tool_use') {
+            frames.push(
+                {
+                    event: 'content_block_start',
+                    data: {
+                        type: 'content_block_start',
+                        index: event.index,
+                        content_block: {
+                            type: 'server_tool_use',
+                            id: event.id,
+                            name: event.name,
+                            input: {},
+                        },
+                    },
+                },
+                {
+                    event: 'content_block_delta',
+                    data: {
+                        type: 'content_block_delta',
+                        index: event.index,
+                        delta: {
+                            type: 'input_json_delta',
+                            partial_json: JSON.stringify(event.input),
+                        },
+                    },
+                },
+                {
+                    event: 'content_block_stop',
+                    data: {
+                        type: 'content_block_stop',
+                        index: event.index,
+                    },
+                },
+            );
+        } else if (event.type === 'web_search_tool_result') {
+            frames.push(
+                {
+                    event: 'content_block_start',
+                    data: {
+                        type: 'content_block_start',
+                        index: event.index,
+                        content_block: {
+                            type: 'web_search_tool_result',
+                            tool_use_id: event.toolUseId,
+                            content: event.content,
+                        },
+                    },
+                },
+                {
+                    event: 'content_block_stop',
+                    data: {
+                        type: 'content_block_stop',
+                        index: event.index,
+                    },
+                },
+            );
         } else if (event.type === 'ping') {
             frames.push({
                 event: 'ping',

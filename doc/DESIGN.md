@@ -183,14 +183,25 @@ Anthropic tools map to OpenAI function tools:
 - Use non-strict schema mode, aligned with Pi's Codex provider.
 - Do not mutate schemas to satisfy OpenAI strict mode.
 
+Anthropic hosted web search maps separately from function tools:
+
+- Accept basic `web_search_20250305` with `name: "web_search"`.
+- Map it to Responses hosted `{ "type": "web_search" }`.
+- Forward non-empty domain filters and approximate `user_location` when provided.
+- Accept and validate `max_uses`, but do not forward it because `search_context_size` controls returned search context, not search-call count.
+- Emit Anthropic `server_tool_use` and `web_search_tool_result` response blocks for completed Codex web-search calls.
+- Report `usage.server_tool_use.web_search_requests` when hosted search is used.
+- Reject newer Anthropic web-search variants until dynamic filtering and response-inclusion semantics are intentionally designed.
+
 Enable parallel tool calls.
 
 Tool choice:
 
 - Omitted or `auto` -> Codex auto.
-- `any` -> Codex auto in v1.
+- `any` -> Responses `required`.
 - `none` -> disable tools for that request if sent.
-- Named forced tool -> reject in v1 unless later proven necessary.
+- Named forced function tool -> Responses `{ type: "function", name }`.
+- Named forced web search -> Responses `{ type: "web_search" }`.
 
 ## Tool Id Format
 
@@ -434,6 +445,7 @@ Map only the safe common subset, biased toward live Codex-verified behavior over
 - `stop_sequences` -> accepted and validated as `string[]`, but intentionally not forwarded upstream.
 - `tool_choice.any` -> Responses `required`.
 - named `tool_choice` -> Responses `{ type: "function", name }`.
+- named `tool_choice` for `web_search` -> Responses `{ type: "web_search" }`.
 - `tool_choice.disable_parallel_tool_use === true` -> Responses `parallel_tool_calls: false`.
 - user image blocks -> accepted for both base64 and URL sources, then translated to Responses `input_image`.
 - `top_p` and `top_k` -> unsupported in v1 unless left at Anthropic defaults.

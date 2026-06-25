@@ -1,4 +1,5 @@
 import type { Response, ResponseOutputItem, ResponseReasoningItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
+import { extractWebSearchResultsFromText, serverToolUseIdFromCodexWebSearchId } from '../anthropic/web-search.ts';
 import { ProxyError } from '../protocol/errors.ts';
 import type { InternalAssistantEvent, InternalMessageEndEvent } from '../protocol/events.ts';
 import type { InternalUsage } from '../protocol/usage.ts';
@@ -45,6 +46,7 @@ interface TextBlockState {
     text: string;
     started: boolean;
     ended: boolean;
+    deferred?: boolean;
 }
 
 interface ToolBlockState {
@@ -72,6 +74,13 @@ interface ThinkingBlockState {
 }
 
 type BlockState = TextBlockState | ThinkingBlockState | ToolBlockState;
+
+interface WebSearchCallState {
+    index: number;
+    resultIndex: number;
+    id: string;
+    query: string;
+}
 
 export async function* mapRawCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
     for await (const event of events) {
@@ -118,9 +127,11 @@ export async function* processCodexStream(
     let messageStarted = false;
     let nextContentIndex = 0;
     let sawTool = false;
+    let webSearchRequests = 0;
     let upstreamResponseId: string | undefined;
     const blocksByOutputIndex = new Map<number, BlockState>();
     const blocksByItemId = new Map<string, BlockState>();
+    const webSearchByOutputIndex = new Map<number, WebSearchCallState>();
 
     const createStart = (): InternalAssistantEvent | undefined => {
         if (messageStarted) {
@@ -146,6 +157,7 @@ export async function* processCodexStream(
             text: '',
             started: false,
             ended: false,
+            deferred: webSearchByOutputIndex.size > 0,
         };
         nextContentIndex += 1;
         blocksByOutputIndex.set(outputIndex, block);
@@ -217,6 +229,10 @@ export async function* processCodexStream(
         block.started = true;
 
         if (block.kind === 'text') {
+            if (block.deferred) {
+                block.started = true;
+                return;
+            }
             yield {
                 type: 'text_start',
                 index: block.index,
@@ -275,6 +291,14 @@ export async function* processCodexStream(
                         partialJson: block.partialJson,
                     };
                 }
+            } else if (item.type === 'web_search_call') {
+                webSearchByOutputIndex.set(event.output_index, {
+                    index: nextContentIndex,
+                    resultIndex: nextContentIndex + 1,
+                    id: serverToolUseIdFromCodexWebSearchId(item.id),
+                    query: '',
+                });
+                nextContentIndex += 2;
             }
             continue;
         }
@@ -329,6 +353,9 @@ export async function* processCodexStream(
                 yield startEvent;
             }
             block.text += event.delta;
+            if (block.deferred) {
+                continue;
+            }
             yield {
                 type: 'text_delta',
                 index: block.index,
@@ -343,6 +370,9 @@ export async function* processCodexStream(
                 yield startEvent;
             }
             block.text += event.delta;
+            if (block.deferred) {
+                continue;
+            }
             yield {
                 type: 'text_delta',
                 index: block.index,
@@ -398,6 +428,9 @@ export async function* processCodexStream(
                     yield startEvent;
                 }
                 block.text = event.item.content.map((part) => (part.type === 'output_text' ? part.text : part.refusal)).join('');
+                if (block.deferred) {
+                    continue;
+                }
                 if (!block.ended) {
                     block.ended = true;
                     yield {
@@ -405,6 +438,12 @@ export async function* processCodexStream(
                         index: block.index,
                         text: block.text,
                     };
+                }
+            } else if (event.item.type === 'web_search_call') {
+                const search = webSearchByOutputIndex.get(event.output_index);
+                if (search) {
+                    search.query = webSearchQuery(event.item);
+                    webSearchRequests += 1;
                 }
             } else if (event.item.type === 'reasoning') {
                 const block = ensureThinkingBlock(event.output_index, event.item);
@@ -474,6 +513,47 @@ export async function* processCodexStream(
             if (start) {
                 yield start;
             }
+            if (webSearchByOutputIndex.size > 0) {
+                const text = [...blocksByOutputIndex.values()]
+                    .filter((block): block is TextBlockState => block.kind === 'text')
+                    .map((block) => block.text)
+                    .join('\n');
+                const results = extractWebSearchResultsFromText(text);
+                for (const search of webSearchByOutputIndex.values()) {
+                    yield {
+                        type: 'server_tool_use',
+                        index: search.index,
+                        id: search.id,
+                        name: 'web_search',
+                        input: { query: search.query },
+                    };
+                    yield {
+                        type: 'web_search_tool_result',
+                        index: search.resultIndex,
+                        toolUseId: search.id,
+                        content: results,
+                    };
+                }
+                for (const block of deferredTextBlocks(blocksByOutputIndex)) {
+                    yield {
+                        type: 'text_start',
+                        index: block.index,
+                    };
+                    if (block.text.length > 0) {
+                        yield {
+                            type: 'text_delta',
+                            index: block.index,
+                            delta: block.text,
+                        };
+                    }
+                    block.ended = true;
+                    yield {
+                        type: 'text_end',
+                        index: block.index,
+                        text: block.text,
+                    };
+                }
+            }
             for (const closeEvent of closeOpenBlocks(blocksByOutputIndex)) {
                 yield closeEvent;
             }
@@ -486,7 +566,7 @@ export async function* processCodexStream(
             yield {
                 type: 'message_end',
                 stopReason: mapStopReason(response, sawTool),
-                usage: mapUsage(response),
+                usage: mapUsage(response, webSearchRequests),
                 upstreamResponseId,
             } satisfies InternalMessageEndEvent;
             return;
@@ -513,6 +593,12 @@ function getToolBlock(
     }
     const byOutput = byOutputIndex.get(outputIndex);
     return byOutput?.kind === 'tool' ? byOutput : undefined;
+}
+
+function deferredTextBlocks(blocks: Map<number, BlockState>): TextBlockState[] {
+    return [...blocks.values()]
+        .filter((block): block is TextBlockState => block.kind === 'text' && block.deferred === true)
+        .sort((left, right) => left.index - right.index);
 }
 
 function* closeOpenBlocks(blocks: Map<number, BlockState>): Generator<InternalAssistantEvent> {
@@ -551,6 +637,19 @@ function* closeOpenBlocks(blocks: Map<number, BlockState>): Generator<InternalAs
             };
         }
     }
+}
+
+function webSearchQuery(item: unknown): string {
+    const action = asRecord(asRecord(item)?.action);
+    const queries = action?.queries;
+    if (Array.isArray(queries)) {
+        const first = queries.find((query) => typeof query === 'string');
+        if (typeof first === 'string') {
+            return first;
+        }
+    }
+    const query = action?.query;
+    return typeof query === 'string' ? query : '';
 }
 
 function parseToolInput(value: string): Record<string, unknown> {
@@ -625,9 +724,9 @@ function createSyntheticReasoningItem(block: ThinkingBlockState): ResponseReason
     };
 }
 
-function mapUsage(response: Response): InternalUsage | undefined {
+function mapUsage(response: Response, webSearchRequests = 0): InternalUsage | undefined {
     if (!response.usage) {
-        return undefined;
+        return webSearchRequests > 0 ? { webSearchRequests } : undefined;
     }
     const inputTokens = response.usage.input_tokens;
     const cachedTokens = Math.max(0, response.usage.input_tokens_details?.cached_tokens ?? 0);
@@ -635,6 +734,7 @@ function mapUsage(response: Response): InternalUsage | undefined {
         inputTokens: Math.max(0, inputTokens - cachedTokens),
         outputTokens: response.usage.output_tokens,
         cacheReadInputTokens: cachedTokens,
+        webSearchRequests,
     };
 }
 

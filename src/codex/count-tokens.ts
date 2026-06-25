@@ -77,6 +77,9 @@ function countTools(tools: CodexResponsesRequest['tools']): number {
         if (!isRecord(tool)) {
             return total;
         }
+        if (asString(tool.type) !== 'function') {
+            return total + tokenCount(JSON.stringify(tool));
+        }
         const nameOrType = 'name' in tool ? asString(tool.name) : asString(tool.type);
         const description = 'description' in tool ? asString(tool.description) : '';
         const parameters = 'parameters' in tool && tool.parameters !== undefined ? JSON.stringify(tool.parameters) : '';

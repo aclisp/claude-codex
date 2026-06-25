@@ -1,4 +1,5 @@
 import { ProxyValidationError } from '../protocol/errors.ts';
+import type { AnthropicWebSearchResult, AnthropicWebSearchToolResultError } from './web-search.ts';
 
 export interface AnthropicMessageRequest {
     model?: string;
@@ -27,7 +28,13 @@ export interface AnthropicMessage {
 export type AnthropicMessageContent = string | AnthropicUserContentBlock[] | AnthropicAssistantContentBlock[] | AnthropicTextBlock[];
 
 export type AnthropicUserContentBlock = AnthropicTextBlock | AnthropicImageBlock | AnthropicToolResultBlock;
-export type AnthropicAssistantContentBlock = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinkingBlock | AnthropicToolUseBlock;
+export type AnthropicAssistantContentBlock =
+    | AnthropicTextBlock
+    | AnthropicThinkingBlock
+    | AnthropicRedactedThinkingBlock
+    | AnthropicToolUseBlock
+    | AnthropicServerToolUseBlock
+    | AnthropicWebSearchToolResultBlock;
 
 export interface AnthropicTextBlock {
     type: 'text';
@@ -44,6 +51,19 @@ export interface AnthropicToolUseBlock {
     id: string;
     name: string;
     input: Record<string, unknown>;
+}
+
+export interface AnthropicServerToolUseBlock {
+    type: 'server_tool_use';
+    id: string;
+    name: string;
+    input: Record<string, unknown>;
+}
+
+export interface AnthropicWebSearchToolResultBlock {
+    type: 'web_search_tool_result';
+    tool_use_id: string;
+    content?: AnthropicWebSearchResult[] | AnthropicWebSearchToolResultError;
 }
 
 export interface AnthropicThinkingBlock {
@@ -76,10 +96,30 @@ export interface AnthropicToolResultImageBlock {
 
 export type AnthropicToolResultContentBlock = AnthropicToolResultTextBlock | AnthropicToolResultImageBlock | (Record<string, unknown> & { type?: unknown });
 
-export interface AnthropicTool {
+export type AnthropicTool = AnthropicFunctionTool | AnthropicWebSearchTool;
+
+export interface AnthropicFunctionTool {
+    type?: undefined;
     name: string;
     description?: string;
     input_schema: Record<string, unknown>;
+}
+
+export interface AnthropicWebSearchTool {
+    type: 'web_search_20250305';
+    name: 'web_search';
+    max_uses?: number;
+    allowed_domains?: string[];
+    blocked_domains?: string[];
+    user_location?: AnthropicWebSearchUserLocation;
+}
+
+export interface AnthropicWebSearchUserLocation {
+    type: 'approximate';
+    city?: string;
+    region?: string;
+    country?: string;
+    timezone?: string;
 }
 
 export interface AnthropicToolChoice {
@@ -103,6 +143,10 @@ export interface AnthropicOutputFormat {
     name?: string;
     schema: Record<string, unknown>;
     strict?: boolean;
+}
+
+export function isAnthropicWebSearchTool(tool: AnthropicTool): tool is AnthropicWebSearchTool {
+    return tool.type === 'web_search_20250305';
 }
 
 const UNSUPPORTED_BEHAVIOR_FIELDS = ['container', 'mcp_servers', 'service_tier'] as const;
@@ -321,6 +365,26 @@ function parseAssistantContentBlock(value: unknown, messageIndex: number, blockI
         };
     }
 
+    if (type === 'server_tool_use') {
+        return {
+            type: 'server_tool_use',
+            id: expectString(raw.id, `messages[${messageIndex}].content[${blockIndex}].id`),
+            name: expectString(raw.name, `messages[${messageIndex}].content[${blockIndex}].name`),
+            input: expectRecord(raw.input, `messages[${messageIndex}].content[${blockIndex}].input`),
+        };
+    }
+
+    if (type === 'web_search_tool_result') {
+        const block: AnthropicWebSearchToolResultBlock = {
+            type: 'web_search_tool_result',
+            tool_use_id: expectString(raw.tool_use_id, `messages[${messageIndex}].content[${blockIndex}].tool_use_id`),
+        };
+        if (raw.content !== undefined) {
+            block.content = parseWebSearchToolResultContent(raw.content, messageIndex, blockIndex);
+        }
+        return block;
+    }
+
     if (type === 'thinking') {
         return {
             type: 'thinking',
@@ -351,6 +415,50 @@ function parseToolResultContent(value: unknown, messageIndex: number, blockIndex
     return value.map((item, itemIndex) => expectRecord(item, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}]`));
 }
 
+function parseWebSearchToolResultContent(
+    value: unknown,
+    messageIndex: number,
+    blockIndex: number,
+): AnthropicWebSearchResult[] | AnthropicWebSearchToolResultError {
+    if (Array.isArray(value)) {
+        return value.map((item, itemIndex) => {
+            const raw = expectRecord(item, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}]`);
+            const type = expectString(raw.type, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].type`);
+            if (type !== 'web_search_result') {
+                throw new ProxyValidationError(`Unsupported web_search_tool_result content type "${type}".`);
+            }
+            const parsed: AnthropicWebSearchResult = {
+                type,
+                title: expectString(raw.title, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].title`),
+                url: expectString(raw.url, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].url`),
+            };
+            if (raw.encrypted_content !== undefined) {
+                parsed.encrypted_content = expectString(
+                    raw.encrypted_content,
+                    `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].encrypted_content`,
+                );
+            }
+            if (raw.page_age !== undefined) {
+                parsed.page_age =
+                    raw.page_age === null
+                        ? null
+                        : expectString(raw.page_age, `messages[${messageIndex}].content[${blockIndex}].content[${itemIndex}].page_age`);
+            }
+            return parsed;
+        });
+    }
+
+    const raw = expectRecord(value, `messages[${messageIndex}].content[${blockIndex}].content`);
+    const type = expectString(raw.type, `messages[${messageIndex}].content[${blockIndex}].content.type`);
+    if (type !== 'web_search_tool_result_error') {
+        throw new ProxyValidationError(`Unsupported web_search_tool_result content type "${type}".`);
+    }
+    return {
+        type,
+        error_code: expectString(raw.error_code, `messages[${messageIndex}].content[${blockIndex}].content.error_code`),
+    };
+}
+
 function parseTools(value: unknown): AnthropicTool[] {
     if (!Array.isArray(value)) {
         throw new ProxyValidationError('tools must be an array.');
@@ -358,7 +466,15 @@ function parseTools(value: unknown): AnthropicTool[] {
 
     return value.map((tool, index) => {
         const raw = expectRecord(tool, `tools[${index}]`);
-        const parsed: AnthropicTool = {
+        const type = raw.type === undefined ? undefined : expectString(raw.type, `tools[${index}].type`);
+        if (type === 'web_search_20250305') {
+            return parseWebSearchTool(raw, index);
+        }
+        if (type?.startsWith('web_search')) {
+            throw new ProxyValidationError(`Unsupported hosted web search tool type "${type}". Only web_search_20250305 is supported.`);
+        }
+
+        const parsed: AnthropicFunctionTool = {
             name: expectString(raw.name, `tools[${index}].name`),
             input_schema: normalizeToolInputSchema(raw.input_schema),
         };
@@ -367,6 +483,54 @@ function parseTools(value: unknown): AnthropicTool[] {
         }
         return parsed;
     });
+}
+
+function parseWebSearchTool(raw: Record<string, unknown>, index: number): AnthropicWebSearchTool {
+    const name = expectString(raw.name, `tools[${index}].name`);
+    if (name !== 'web_search') {
+        throw new ProxyValidationError('tools[].name must be "web_search" for web_search_20250305.');
+    }
+
+    const parsed: AnthropicWebSearchTool = {
+        type: 'web_search_20250305',
+        name: 'web_search',
+    };
+    if (raw.max_uses !== undefined) {
+        parsed.max_uses = expectPositiveInteger(raw.max_uses, `tools[${index}].max_uses`);
+    }
+    if (raw.allowed_domains !== undefined) {
+        parsed.allowed_domains = parseStringArray(raw.allowed_domains, `tools[${index}].allowed_domains`);
+    }
+    if (raw.blocked_domains !== undefined) {
+        parsed.blocked_domains = parseStringArray(raw.blocked_domains, `tools[${index}].blocked_domains`);
+    }
+    if (raw.user_location !== undefined) {
+        parsed.user_location = parseWebSearchUserLocation(raw.user_location, index);
+    }
+    return parsed;
+}
+
+function parseWebSearchUserLocation(value: unknown, toolIndex: number): AnthropicWebSearchUserLocation {
+    const raw = expectRecord(value, `tools[${toolIndex}].user_location`);
+    const type = expectString(raw.type, `tools[${toolIndex}].user_location.type`);
+    if (type !== 'approximate') {
+        throw new ProxyValidationError('tools[].user_location.type must be "approximate".');
+    }
+
+    const parsed: AnthropicWebSearchUserLocation = { type };
+    if (raw.city !== undefined) {
+        parsed.city = expectString(raw.city, `tools[${toolIndex}].user_location.city`);
+    }
+    if (raw.region !== undefined) {
+        parsed.region = expectString(raw.region, `tools[${toolIndex}].user_location.region`);
+    }
+    if (raw.country !== undefined) {
+        parsed.country = expectString(raw.country, `tools[${toolIndex}].user_location.country`);
+    }
+    if (raw.timezone !== undefined) {
+        parsed.timezone = expectString(raw.timezone, `tools[${toolIndex}].user_location.timezone`);
+    }
+    return parsed;
 }
 
 function normalizeToolInputSchema(value: unknown): Record<string, unknown> {
