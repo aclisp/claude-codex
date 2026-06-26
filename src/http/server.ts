@@ -2,7 +2,7 @@ import { appendFile } from 'node:fs/promises';
 import { parseAnthropicRequest } from '../anthropic/request.ts';
 import { collectAnthropicMessage } from '../anthropic/response.ts';
 import { encodeSseFrame, toAnthropicSseFrames } from '../anthropic/sse.ts';
-import type { CodexClient } from '../codex/client.ts';
+import type { CodexClient, CodexUpstreamRequestDiagnostic } from '../codex/client.ts';
 import { countTranslatedTokens } from '../codex/count-tokens.ts';
 import { CODEX_MODEL_CATALOG } from '../codex/models.ts';
 import { buildCodexRequest } from '../codex/request.ts';
@@ -113,20 +113,34 @@ async function handleMessages(
         promptCacheKey: clampPromptCacheKey(sessionId),
         textVerbosity: config.textVerbosity,
     });
+    const translatedInputTokens = countTranslatedTokens(codexBody);
+    let upstreamRequestDiagnostic: CodexUpstreamRequestDiagnostic | undefined;
 
     const abortController = new AbortController();
     const result = codexClient.stream(codexBody, {
         sessionId,
         signal: abortController.signal,
+        onUpstreamRequest: (diagnostic) => {
+            upstreamRequestDiagnostic = diagnostic;
+        },
     });
 
     if (anthropicRequest.stream === true) {
-        const response = await createStreamingResponse(result.events, abortController, logger, startedAt, {
-            route: '/v1/messages',
-            model: codexBody.model,
-            sessionId,
-            transport: result.transport,
-        });
+        const response = await createStreamingResponse(
+            result.events,
+            abortController,
+            logger,
+            startedAt,
+            {
+                route: '/v1/messages',
+                model: codexBody.model,
+                sessionId,
+                transport: result.transport,
+            },
+            translatedInputTokens,
+            () => upstreamRequestDiagnostic,
+            config.tokenDiagnostics,
+        );
         return response;
     }
 
@@ -145,6 +159,14 @@ async function handleMessages(
         inputTokens: message.usage.input_tokens,
         outputTokens: message.usage.output_tokens,
         cacheReadInputTokens: message.usage.cache_read_input_tokens,
+        ...tokenDiagnostic({
+            inputTokens: message.usage.input_tokens,
+            cacheReadInputTokens: message.usage.cache_read_input_tokens,
+            webSearchRequests: message.usage.server_tool_use?.web_search_requests,
+            translatedInputTokens,
+            upstreamRequestDiagnostic,
+            mode: config.tokenDiagnostics,
+        }),
     });
     return jsonResponse(message);
 }
@@ -177,6 +199,9 @@ async function createStreamingResponse(
     logger: ProxyLogger,
     startedAt: number,
     logFields: Record<string, unknown>,
+    translatedInputTokens?: number,
+    upstreamRequestDiagnostic?: () => CodexUpstreamRequestDiagnostic | undefined,
+    tokenDiagnostics: ProxyRuntimeConfig['tokenDiagnostics'] = 'threshold',
 ): Promise<Response> {
     const iterator = events[Symbol.asyncIterator]();
     let first: IteratorResult<InternalAssistantEvent>;
@@ -216,6 +241,7 @@ async function createStreamingResponse(
             let inputTokens: number | undefined;
             let outputTokens: number | undefined;
             let cacheReadInputTokens: number | undefined;
+            let webSearchRequests: number | undefined;
             let errorType: string | undefined;
             let errorMessage: string | undefined;
             try {
@@ -237,6 +263,7 @@ async function createStreamingResponse(
                         inputTokens = event.usage?.inputTokens;
                         outputTokens = event.usage?.outputTokens;
                         cacheReadInputTokens = event.usage?.cacheReadInputTokens;
+                        webSearchRequests = event.usage?.webSearchRequests;
                     }
                     enqueueEvent(controller, encoder, event);
                 }
@@ -257,6 +284,14 @@ async function createStreamingResponse(
                     inputTokens,
                     outputTokens,
                     cacheReadInputTokens,
+                    ...tokenDiagnostic({
+                        inputTokens,
+                        cacheReadInputTokens,
+                        webSearchRequests,
+                        translatedInputTokens,
+                        upstreamRequestDiagnostic: upstreamRequestDiagnostic?.(),
+                        mode: tokenDiagnostics,
+                    }),
                 });
                 controller.close();
             }
@@ -281,6 +316,41 @@ function enqueueEvent(controller: ReadableStreamDefaultController<Uint8Array>, e
 
 function enqueuePing(controller: ReadableStreamDefaultController<Uint8Array>, encoder: TextEncoder): void {
     controller.enqueue(encoder.encode(encodeSseFrame({ event: 'ping', data: { type: 'ping' } })));
+}
+
+function tokenDiagnostic(fields: {
+    inputTokens?: number;
+    cacheReadInputTokens?: number;
+    webSearchRequests?: number;
+    translatedInputTokens?: number;
+    upstreamRequestDiagnostic?: CodexUpstreamRequestDiagnostic;
+    mode: ProxyRuntimeConfig['tokenDiagnostics'];
+}): Record<string, unknown> {
+    if (fields.mode === 'off') {
+        return {};
+    }
+    const needsDiagnostic =
+        fields.mode === 'all' ||
+        (fields.webSearchRequests !== undefined && fields.webSearchRequests > 0) ||
+        (fields.inputTokens !== undefined && fields.inputTokens >= 10_000) ||
+        (fields.inputTokens !== undefined && fields.inputTokens >= 5_000 && fields.cacheReadInputTokens === 0);
+    if (!needsDiagnostic || fields.translatedInputTokens === undefined) {
+        return {};
+    }
+    const diagnostic: Record<string, unknown> = {
+        translatedInputTokens: fields.translatedInputTokens,
+    };
+    if (fields.upstreamRequestDiagnostic !== undefined) {
+        diagnostic.sentInputTokens = fields.upstreamRequestDiagnostic.sentInputTokens;
+        diagnostic.sentInputItems = fields.upstreamRequestDiagnostic.sentInputItems;
+        if (fields.upstreamRequestDiagnostic.websocketContinuation !== undefined) {
+            diagnostic.websocketContinuation = fields.upstreamRequestDiagnostic.websocketContinuation;
+        }
+    }
+    if (fields.webSearchRequests !== undefined && fields.webSearchRequests > 0) {
+        diagnostic.webSearchRequests = fields.webSearchRequests;
+    }
+    return diagnostic;
 }
 
 async function nextEventOrKeepalive(

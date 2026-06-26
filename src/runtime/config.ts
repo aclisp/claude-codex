@@ -14,6 +14,7 @@ export interface ProxyRuntimeConfig {
     maxBodyBytes: number;
     websocketConnectTimeoutMs: number;
     upstreamIdleTimeoutMs: number;
+    tokenDiagnostics: 'off' | 'threshold' | 'all';
     debugBodiesPath?: string;
 }
 
@@ -51,6 +52,7 @@ export function loadRuntimeConfig(args: string[] = process.argv.slice(2), env: R
             parsedArgs.upstreamIdleTimeoutMs ?? env.CLAUDE_CODEX_UPSTREAM_IDLE_TIMEOUT_MS ?? '0',
             'upstream idle timeout',
         ),
+        tokenDiagnostics: parseTokenDiagnostics(parsedArgs.tokenDiagnostics ?? env.CLAUDE_CODEX_TOKEN_DIAGNOSTICS ?? '1'),
         debugBodiesPath: parsedArgs.debugBodiesPath,
     };
 }
@@ -111,6 +113,19 @@ function parseTextVerbosity(value: string): ProxyRuntimeConfig['textVerbosity'] 
         return value;
     }
     throw new ProxyValidationError('text verbosity must be one of low, medium, or high.');
+}
+
+function parseTokenDiagnostics(value: string): ProxyRuntimeConfig['tokenDiagnostics'] {
+    if (value === '1' || value === 'true' || value === 'on' || value === 'threshold') {
+        return 'threshold';
+    }
+    if (value === '0' || value === 'false' || value === 'off') {
+        return 'off';
+    }
+    if (value === 'all') {
+        return 'all';
+    }
+    throw new ProxyValidationError('token diagnostics must be one of 0, 1, or all.');
 }
 
 const DEFAULT_UPSTREAM_PORTS: Record<string, number> = {

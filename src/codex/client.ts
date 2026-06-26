@@ -2,6 +2,7 @@ import type { ResponseInput, ResponseOutputItem } from 'openai/resources/respons
 import type { InternalAssistantEvent } from '../protocol/events.ts';
 import { createRequestId } from '../runtime/id.ts';
 import type { CodexAuthReader, CodexCredentials } from './auth.ts';
+import { countTranslatedTokens } from './count-tokens.ts';
 import { buildSseHeaders, buildWebSocketHeaders } from './headers.ts';
 import type { CodexResponsesRequest } from './request.ts';
 import { CodexApiError, CodexProtocolError, mapRawCodexEvents, processCodexStream } from './stream.ts';
@@ -28,6 +29,7 @@ export interface CodexClientOptions {
 export interface CodexStreamOptions {
     sessionId: string;
     signal?: AbortSignal;
+    onUpstreamRequest?: (diagnostic: CodexUpstreamRequestDiagnostic) => void;
 }
 
 export interface CodexStreamResult {
@@ -40,6 +42,12 @@ export interface CodexTransportFallbackEvent {
     from: 'websocket';
     to: 'sse';
     reason: string;
+}
+
+export interface CodexUpstreamRequestDiagnostic {
+    sentInputTokens: number;
+    sentInputItems: number;
+    websocketContinuation?: 'none' | 'full' | 'delta';
 }
 
 type WebSocketEventType = 'open' | 'message' | 'error' | 'close';
@@ -173,11 +181,13 @@ export class CodexClient {
         const acquired = await this.acquireWebSocket(credentials, options);
         let keepConnection = true;
         const fullBody = body;
-        const requestBody = acquired.entry ? buildCachedWebSocketRequestBody(acquired.entry, fullBody) : fullBody;
+        const builtRequest = acquired.entry ? buildCachedWebSocketRequestBody(acquired.entry, fullBody) : { body: fullBody, websocketContinuation: undefined };
+        const requestBody = builtRequest.body;
         const responseItems: ResponseOutputItem[] = [];
         let responseId: string | undefined;
 
         try {
+            options.onUpstreamRequest?.(createUpstreamRequestDiagnostic(requestBody, builtRequest.websocketContinuation));
             acquired.socket.send(JSON.stringify({ type: 'response.create', ...requestBody }));
             yield* this.processRawEvents(
                 tapRawEvents(parseWebSocket(acquired.socket, options.signal, this.options.upstreamIdleTimeoutMs), onRawEvent),
@@ -234,6 +244,7 @@ export class CodexClient {
         credentials: CodexCredentials,
         options: CodexStreamOptions,
     ): AsyncGenerator<Record<string, unknown>> {
+        options.onUpstreamRequest?.(createUpstreamRequestDiagnostic(body));
         const requestInit: BunRequestInit = {
             method: 'POST',
             headers: buildSseHeaders(credentials, options.sessionId),
@@ -585,21 +596,35 @@ async function* tapRawEvents(events: AsyncIterable<Record<string, unknown>>, onE
     }
 }
 
-function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body: CodexResponsesRequest): CodexResponsesRequest {
+function createUpstreamRequestDiagnostic(body: CodexResponsesRequest, websocketContinuation?: CodexUpstreamRequestDiagnostic['websocketContinuation']) {
+    return {
+        sentInputTokens: countTranslatedTokens(body),
+        sentInputItems: body.input.length,
+        websocketContinuation,
+    };
+}
+
+function buildCachedWebSocketRequestBody(
+    entry: CachedWebSocketConnection,
+    body: CodexResponsesRequest,
+): { body: CodexResponsesRequest; websocketContinuation: CodexUpstreamRequestDiagnostic['websocketContinuation'] } {
     if (!entry.continuation) {
-        return body;
+        return { body, websocketContinuation: 'none' };
     }
 
     const delta = getCachedWebSocketInputDelta(body, entry.continuation);
     if (!delta) {
         entry.continuation = undefined;
-        return body;
+        return { body, websocketContinuation: 'full' };
     }
 
     return {
-        ...body,
-        previous_response_id: entry.continuation.lastResponseId,
-        input: delta,
+        body: {
+            ...body,
+            previous_response_id: entry.continuation.lastResponseId,
+            input: delta,
+        },
+        websocketContinuation: 'delta',
     };
 }
 

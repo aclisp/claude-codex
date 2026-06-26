@@ -5,7 +5,7 @@ import type { ResponseReasoningItem } from 'openai/resources/responses/responses
 import { collectAnthropicMessage } from './anthropic/response.ts';
 import { toAnthropicSseFrames } from './anthropic/sse.ts';
 import { CodexAuthReader } from './codex/auth.ts';
-import { CodexClient } from './codex/client.ts';
+import { CodexClient, type CodexUpstreamRequestDiagnostic } from './codex/client.ts';
 import { buildCodexRequest } from './codex/request.ts';
 import { mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
 import { createProxyServer } from './http/server.ts';
@@ -38,6 +38,15 @@ describe('Codex auth reader', () => {
 describe('Runtime config', () => {
     test('defaults Codex reasoning effort to medium', () => {
         expect(loadRuntimeConfig([], { HOME: '/tmp/test-home' }).defaultEffort).toBe('medium');
+        expect(loadRuntimeConfig([], { HOME: '/tmp/test-home' }).tokenDiagnostics).toBe('threshold');
+    });
+
+    test('configures token diagnostics from env and args', () => {
+        expect(loadRuntimeConfig([], { HOME: '/tmp/test-home', CLAUDE_CODEX_TOKEN_DIAGNOSTICS: '0' }).tokenDiagnostics).toBe('off');
+        expect(loadRuntimeConfig([], { HOME: '/tmp/test-home', CLAUDE_CODEX_TOKEN_DIAGNOSTICS: 'all' }).tokenDiagnostics).toBe('all');
+        expect(loadRuntimeConfig(['--token-diagnostics', 'off'], { HOME: '/tmp/test-home', CLAUDE_CODEX_TOKEN_DIAGNOSTICS: 'all' }).tokenDiagnostics).toBe(
+            'off',
+        );
     });
 
     test('resolves upstream proxy from HTTPS proxy env', () => {
@@ -377,6 +386,201 @@ describe('HTTP proxy server', () => {
         });
     });
 
+    test('logs translated input estimate for completed web search requests', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-web-search-log-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex')], { HOME: dir }), {
+            codexClient: fakeCodexClient(
+                [
+                    { type: 'message_start', messageId: 'msg_ccx_test', model: 'gpt-5.4-mini', createdAt: 1 },
+                    { type: 'text_start', index: 0 },
+                    { type: 'text_delta', index: 0, delta: 'Search-backed answer.' },
+                    { type: 'text_end', index: 0, text: 'Search-backed answer.' },
+                    {
+                        type: 'message_end',
+                        stopReason: 'end_turn',
+                        usage: {
+                            inputTokens: 50_000,
+                            outputTokens: 3,
+                            cacheReadInputTokens: 0,
+                            webSearchRequests: 1,
+                        },
+                    },
+                ],
+                { sentInputTokens: 96, sentInputItems: 1, websocketContinuation: 'delta' },
+            ),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-search-log' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                    messages: [{ role: 'user', content: 'search for current info' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(logs.at(-1)).toMatchObject({
+            route: '/v1/messages',
+            status: 200,
+            inputTokens: 50_000,
+            cacheReadInputTokens: 0,
+            webSearchRequests: 1,
+            sentInputTokens: 96,
+            sentInputItems: 1,
+            websocketContinuation: 'delta',
+        });
+        expect(logs.at(-1)?.translatedInputTokens).toBeGreaterThan(0);
+        expect(logs.at(-1)?.translatedInputTokens).toBeLessThan(50_000);
+    });
+
+    test('logs translated input estimate for high input cache misses without web search', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-high-input-log-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex')], { HOME: dir }), {
+            codexClient: fakeCodexClient(
+                [
+                    { type: 'message_start', messageId: 'msg_ccx_test', model: 'gpt-5.4-mini', createdAt: 1 },
+                    { type: 'text_start', index: 0 },
+                    { type: 'text_delta', index: 0, delta: 'Large prompt answer.' },
+                    { type: 'text_end', index: 0, text: 'Large prompt answer.' },
+                    {
+                        type: 'message_end',
+                        stopReason: 'end_turn',
+                        usage: {
+                            inputTokens: 12_000,
+                            outputTokens: 3,
+                            cacheReadInputTokens: 0,
+                        },
+                    },
+                ],
+                { sentInputTokens: 11_500, sentInputItems: 8, websocketContinuation: 'full' },
+            ),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-high-input-log' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(logs.at(-1)).toMatchObject({
+            route: '/v1/messages',
+            status: 200,
+            inputTokens: 12_000,
+            cacheReadInputTokens: 0,
+            sentInputTokens: 11_500,
+            sentInputItems: 8,
+            websocketContinuation: 'full',
+        });
+        expect(logs.at(-1)?.translatedInputTokens).toBeGreaterThan(0);
+        expect(logs.at(-1)).not.toHaveProperty('webSearchRequests');
+    });
+
+    test('suppresses token diagnostics when disabled', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-token-diag-off-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex'), '--token-diagnostics', 'off'], { HOME: dir }), {
+            codexClient: fakeCodexClient(
+                [
+                    { type: 'message_start', messageId: 'msg_ccx_test', model: 'gpt-5.4-mini', createdAt: 1 },
+                    { type: 'text_start', index: 0 },
+                    { type: 'text_delta', index: 0, delta: 'Large prompt answer.' },
+                    { type: 'text_end', index: 0, text: 'Large prompt answer.' },
+                    {
+                        type: 'message_end',
+                        stopReason: 'end_turn',
+                        usage: {
+                            inputTokens: 12_000,
+                            outputTokens: 3,
+                            cacheReadInputTokens: 0,
+                            webSearchRequests: 1,
+                        },
+                    },
+                ],
+                { sentInputTokens: 11_500, sentInputItems: 8, websocketContinuation: 'full' },
+            ),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-token-diag-off' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(logs.at(-1)).not.toHaveProperty('translatedInputTokens');
+        expect(logs.at(-1)).not.toHaveProperty('sentInputTokens');
+        expect(logs.at(-1)).not.toHaveProperty('webSearchRequests');
+    });
+
+    test('logs token diagnostics for every success in all mode', async () => {
+        const logs: Record<string, unknown>[] = [];
+        const dir = await mkdtemp('/private/tmp/claude-codex-token-diag-all-');
+        const server = createProxyServer(loadRuntimeConfig(['--state-dir', join(dir, '.claude-codex'), '--token-diagnostics', 'all'], { HOME: dir }), {
+            codexClient: fakeCodexClient(
+                [
+                    { type: 'message_start', messageId: 'msg_ccx_test', model: 'gpt-5.4-mini', createdAt: 1 },
+                    { type: 'text_start', index: 0 },
+                    { type: 'text_delta', index: 0, delta: 'Small answer.' },
+                    { type: 'text_end', index: 0, text: 'Small answer.' },
+                    {
+                        type: 'message_end',
+                        stopReason: 'end_turn',
+                        usage: {
+                            inputTokens: 100,
+                            outputTokens: 3,
+                            cacheReadInputTokens: 0,
+                        },
+                    },
+                ],
+                { sentInputTokens: 90, sentInputItems: 1 },
+            ),
+            logger: captureLogger(logs),
+        });
+
+        const response = await server.fetch(
+            new Request('http://127.0.0.1/v1/messages', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'session-token-diag-all' },
+                body: JSON.stringify({
+                    model: 'gpt-5.4-mini',
+                    max_tokens: 64,
+                    messages: [{ role: 'user', content: 'hello' }],
+                }),
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        expect(logs.at(-1)).toMatchObject({
+            inputTokens: 100,
+            translatedInputTokens: expect.any(Number),
+            sentInputTokens: 90,
+            sentInputItems: 1,
+        });
+    });
+
     test('logs validation error details for rejected requests', async () => {
         const logs: Record<string, unknown>[] = [];
         const dir = await mkdtemp('/private/tmp/claude-codex-log-error-');
@@ -640,6 +844,65 @@ describe('Codex transport', () => {
         expect(collectAnthropicMessage(retryEvents).content).toEqual([{ type: 'text', text: 'Hello from WebSocket' }]);
     });
 
+    test('reports WebSocket upstream request diagnostics for full and delta input', async () => {
+        const dir = await mkdtemp('/private/tmp/claude-codex-ws-diagnostic-');
+        const authPath = join(dir, 'auth.json');
+        await writeFile(authPath, JSON.stringify({ tokens: { access_token: 'access_test', account_id: 'acct_test' } }));
+        const diagnostics: CodexUpstreamRequestDiagnostic[] = [];
+        RecoveringWebSocket.reset(['success']);
+        const client = new CodexClient({
+            baseUrl: 'https://chatgpt.com/backend-api',
+            authReader: new CodexAuthReader(authPath),
+            websocketConnectTimeoutMs: 50,
+            upstreamIdleTimeoutMs: 0,
+            WebSocketCtor: RecoveringWebSocket,
+            fetchFn: async () => createSseResponse(),
+        });
+        const firstBody = buildCodexRequest({
+            model: 'gpt-5.4-mini',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hello' }],
+        });
+
+        await collectAsync(
+            client.stream(firstBody, {
+                sessionId: 'session-ws-diagnostic',
+                onUpstreamRequest: (diagnostic) => diagnostics.push(diagnostic),
+            }).events,
+        );
+        const secondBody = {
+            ...firstBody,
+            input: [
+                ...firstBody.input,
+                {
+                    type: 'message',
+                    id: 'msg_ws',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [{ type: 'output_text', text: 'Hello from WebSocket', annotations: [] }],
+                },
+                { role: 'user', content: [{ type: 'input_text', text: 'second question' }] },
+            ] as typeof firstBody.input,
+        };
+        await collectAsync(
+            client.stream(secondBody, {
+                sessionId: 'session-ws-diagnostic',
+                onUpstreamRequest: (diagnostic) => diagnostics.push(diagnostic),
+            }).events,
+        );
+
+        expect(diagnostics[0]).toMatchObject({
+            sentInputItems: firstBody.input.length,
+            websocketContinuation: 'none',
+        });
+        expect(diagnostics[0]?.sentInputTokens).toBeGreaterThan(0);
+        expect(diagnostics[1]).toMatchObject({
+            sentInputItems: 1,
+            websocketContinuation: 'delta',
+        });
+        expect(diagnostics[1]?.sentInputTokens).toBeGreaterThan(0);
+    });
+
     test('does not replay through SSE when WebSocket fails after upstream events', async () => {
         const dir = await mkdtemp('/private/tmp/claude-codex-fallback-partial-');
         const authPath = join(dir, 'auth.json');
@@ -822,9 +1085,12 @@ async function collectAsync<T>(events: AsyncIterable<T>): Promise<T[]> {
     return result;
 }
 
-function fakeCodexClient(events: InternalAssistantEvent[]) {
+function fakeCodexClient(events: InternalAssistantEvent[], upstreamRequestDiagnostic?: CodexUpstreamRequestDiagnostic) {
     return {
-        stream() {
+        stream(_body: unknown, options?: { onUpstreamRequest?: (diagnostic: CodexUpstreamRequestDiagnostic) => void }) {
+            if (upstreamRequestDiagnostic !== undefined) {
+                options?.onUpstreamRequest?.(upstreamRequestDiagnostic);
+            }
             return {
                 transport: 'sse' as const,
                 events: asyncInternalIterable(events),
