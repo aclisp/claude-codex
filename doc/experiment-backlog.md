@@ -23,6 +23,10 @@ This file tracks possible future proxy experiments that are **not** current impl
 - `service_tier`, `container`, or other fields that exist in public OpenAI Responses docs but may not behave the same on the Codex endpoint
   - Treat public docs as hints only; require endpoint-specific verification.
 
+- WebSocket continuation matcher normalization
+  - Live diagnostics showed repeated `websocketContinuation=full` and no delta sends in Claude Code sessions.
+  - Investigate the TODO plan in `doc/design-logs/2026-06-26-websocket-continuation-matcher.md`.
+
 ## Promotion rule
 
 Move an item out of this backlog only when it has concrete live-use demand, direct endpoint validation, or both.
