@@ -1,4 +1,4 @@
-import type { Response, ResponseOutputItem, ResponseReasoningItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
+import type { Response, ResponseInput, ResponseOutputItem, ResponseReasoningItem, ResponseStreamEvent } from 'openai/resources/responses/responses.js';
 import { extractWebSearchResultsFromText, serverToolUseIdFromCodexWebSearchId } from '../anthropic/web-search.ts';
 import { ProxyError } from '../protocol/errors.ts';
 import type { InternalAssistantEvent, InternalMessageEndEvent } from '../protocol/events.ts';
@@ -81,6 +81,8 @@ interface WebSearchCallState {
     id: string;
     query: string;
 }
+
+type ResponseInputItem = ResponseInput[number];
 
 export async function* mapRawCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
     for await (const event of events) {
@@ -579,6 +581,40 @@ export async function* processCodexStream(
             });
         }
     }
+}
+
+export function createReplayInputItemFromResponseOutputItem(item: ResponseOutputItem): ResponseInputItem | undefined {
+    if (item.type === 'message') {
+        return {
+            type: 'message',
+            role: 'assistant',
+            id: item.id,
+            status: 'completed',
+            content: [
+                {
+                    type: 'output_text',
+                    text: item.content.map((part) => (part.type === 'output_text' ? part.text : part.refusal)).join(''),
+                    annotations: [],
+                },
+            ],
+        };
+    }
+
+    if (item.type === 'function_call') {
+        return {
+            type: 'function_call',
+            id: item.id,
+            call_id: item.call_id,
+            name: item.name,
+            arguments: item.arguments || '{}',
+        };
+    }
+
+    if (item.type === 'reasoning') {
+        return item;
+    }
+
+    return undefined;
 }
 
 function getToolBlock(

@@ -21,4 +21,56 @@ The current matcher was copied from Pi Agent, but this proxy has an additional A
 
 Start with a conservative normalizer in the continuation matcher. This is lower risk than redesigning response capture and directly targets the observed `prefix_mismatch` class. If normalization becomes too broad or fragile, switch to storing explicit replay-shaped response items, equivalent to Pi Agent storing converted response items rather than raw upstream output items.
 
-Status: TODO, experiment backlog.
+Status: partially implemented, still in experiment backlog.
+
+#### 2026-06-27 Partial Implementation Notes
+
+The first implementation chose the fallback direction from the recommendation: store explicit replay-shaped response items rather than raw upstream `response.output_item.done` items. The continuation cache now stores completed assistant text messages, function calls, and reasoning items in Responses input shape, and it skips hosted web-search output items because Anthropic replay drops `server_tool_use` and `web_search_tool_result` blocks when translating back to Codex input.
+
+The matcher also gained a narrow assistant-message comparison rule that ignores assistant message IDs. This is necessary because Anthropic-to-Codex replay still creates synthetic text message IDs such as `msg_ccx_replay_*`, while upstream output messages carry OpenAI-generated IDs such as `msg_*`. This is not a semantic difference for text replay.
+
+Implemented from the TODO plan:
+
+1. Store replay-shaped response items instead of raw output items.
+2. Keep exact matching for non-input request fields.
+3. Ignore assistant text replay-only IDs during prefix comparison.
+4. Continue dropping hosted web-search output items from the continuation baseline.
+5. Add tests for replay-shaped item construction and assistant text replay ID mismatch producing `websocketContinuation=delta`.
+
+Not yet implemented:
+
+1. A full structured normalizer for all input item types.
+2. Function-call matching by `call_id`, `name`, and `arguments` while tolerating non-semantic item ID differences.
+3. Reasoning matching via proxy-owned reasoning signatures instead of exact stored item equality.
+4. Miss-reason diagnostics such as `websocketContinuationMiss=body_changed|input_shorter|prefix_mismatch`.
+5. Broader tests for changed tools/instructions, tool-use replay, compacted or truncated history, and reasoning replay.
+
+#### 2026-06-27 Live Verification Notes
+
+After the partial implementation, live logs showed successful delta continuation:
+
+```text
+translatedInputTokens=90969 sentInputTokens=25354 sentInputItems=1 websocketContinuation=delta
+translatedInputTokens=94221 sentInputTokens=25063 sentInputItems=1 websocketContinuation=delta
+translatedInputTokens=99485 sentInputTokens=25704 sentInputItems=2 websocketContinuation=delta
+```
+
+This confirms the previous "always full" behavior was improved. However, logs still showed intermittent full sends, especially around hosted web-search and tool-use subturns:
+
+```text
+translatedInputTokens=95 sentInputTokens=95 sentInputItems=1 webSearchRequests=1
+translatedInputTokens=95825 sentInputTokens=95825 sentInputItems=113 websocketContinuation=full
+```
+
+The likely cause is continuation baseline overwrite. A tiny hosted web-search side turn can complete successfully and replace the cached continuation anchor with a small request. The next large Claude Code history no longer matches `lastRequestBody.input + lastResponseItems`, so the matcher correctly refuses delta and sends the full translated request.
+
+#### Remaining Plan
+
+1. Add a conservative continuation-update policy. Do not let a tiny side turn replace a much larger long-history continuation baseline.
+2. Always allow continuation updates when the request used `websocketContinuation=delta`, because that advances the existing chain.
+3. Allow the first successful cached WebSocket request to seed continuation when no previous continuation exists.
+4. When a request sends `websocketContinuation=full`, replace the existing baseline only if it appears to be the canonical Claude session history, for example similar or larger input item/token size than the existing baseline.
+5. Skip continuation overwrite for hosted web-search-only tiny full requests while still allowing them to use WebSocket transport.
+6. Add miss/update diagnostics before tuning the heuristic, ideally distinguishing `no_cached_continuation`, `temporary_busy_socket`, `body_changed`, `input_shorter`, `prefix_mismatch`, and `baseline_update_skipped`.
+
+Recommendation: implement continuation-update gating next, with diagnostics first or in the same patch. The desired behavior is that Claude Code keeps working through hosted web-search side turns without letting those side turns become the long-lived WebSocket continuation anchor.

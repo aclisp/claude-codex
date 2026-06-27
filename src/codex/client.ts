@@ -5,7 +5,7 @@ import type { CodexAuthReader, CodexCredentials } from './auth.ts';
 import { countTranslatedTokens } from './count-tokens.ts';
 import { buildSseHeaders, buildWebSocketHeaders } from './headers.ts';
 import type { CodexResponsesRequest } from './request.ts';
-import { CodexApiError, CodexProtocolError, mapRawCodexEvents, processCodexStream } from './stream.ts';
+import { CodexApiError, CodexProtocolError, createReplayInputItemFromResponseOutputItem, mapRawCodexEvents, processCodexStream } from './stream.ts';
 import { resolveCodexUrl, resolveCodexWebSocketUrl } from './url.ts';
 
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60_000;
@@ -76,7 +76,7 @@ interface BunWebSocketOptions {
 interface CachedWebSocketContinuation {
     lastRequestBody: CodexResponsesRequest;
     lastResponseId: string;
-    lastResponseItems: ResponseOutputItem[];
+    lastResponseItems: ResponseInput;
 }
 
 interface CachedWebSocketConnection {
@@ -183,7 +183,7 @@ export class CodexClient {
         const fullBody = body;
         const builtRequest = acquired.entry ? buildCachedWebSocketRequestBody(acquired.entry, fullBody) : { body: fullBody, websocketContinuation: undefined };
         const requestBody = builtRequest.body;
-        const responseItems: ResponseOutputItem[] = [];
+        const responseItems: ResponseInput = [];
         let responseId: string | undefined;
 
         try {
@@ -197,7 +197,10 @@ export class CodexClient {
                         responseId = id;
                     },
                     onOutputItemDone: (item) => {
-                        responseItems.push(item);
+                        const replayItem = createReplayInputItemFromResponseOutputItem(item);
+                        if (replayItem) {
+                            responseItems.push(replayItem);
+                        }
                     },
                 },
             );
@@ -638,10 +641,38 @@ function getCachedWebSocketInputDelta(body: CodexResponsesRequest, continuation:
     if (currentInput.length < baseline.length) {
         return undefined;
     }
-    if (JSON.stringify(currentInput.slice(0, baseline.length)) !== JSON.stringify(baseline)) {
+    if (!inputPrefixMatches(currentInput, baseline)) {
         return undefined;
     }
     return currentInput.slice(baseline.length);
+}
+
+function inputPrefixMatches(currentInput: ResponseInput, baseline: ResponseInput): boolean {
+    for (let index = 0; index < baseline.length; index += 1) {
+        if (!inputItemsMatch(currentInput[index], baseline[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function inputItemsMatch(current: unknown, baseline: unknown): boolean {
+    if (isAssistantMessageItem(current) && isAssistantMessageItem(baseline)) {
+        const { id: _currentId, ...currentRest } = current;
+        const { id: _baselineId, ...baselineRest } = baseline;
+        return JSON.stringify(currentRest) === JSON.stringify(baselineRest);
+    }
+    return JSON.stringify(current) === JSON.stringify(baseline);
+}
+
+function isAssistantMessageItem(value: unknown): value is { type: 'message'; role: 'assistant'; id?: string } {
+    return (
+        typeof value === 'object' &&
+        value !== null &&
+        !Array.isArray(value) &&
+        (value as { type?: unknown }).type === 'message' &&
+        (value as { role?: unknown }).role === 'assistant'
+    );
 }
 
 function requestBodiesMatchExceptInput(a: CodexResponsesRequest, b: CodexResponsesRequest): boolean {

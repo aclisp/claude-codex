@@ -7,7 +7,7 @@ import { toAnthropicSseFrames } from './anthropic/sse.ts';
 import { CodexAuthReader } from './codex/auth.ts';
 import { CodexClient, type CodexUpstreamRequestDiagnostic } from './codex/client.ts';
 import { buildCodexRequest } from './codex/request.ts';
-import { mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
+import { createReplayInputItemFromResponseOutputItem, mapRawCodexEvents, processCodexStream } from './codex/stream.ts';
 import { createProxyServer } from './http/server.ts';
 import type { InternalAssistantEvent } from './protocol/events.ts';
 import { decodeReasoningSignature } from './reasoning/signature.ts';
@@ -128,6 +128,52 @@ describe('Session store', () => {
 });
 
 describe('Codex stream processing', () => {
+    test('builds replay-shaped continuation items from completed output items', () => {
+        expect(
+            createReplayInputItemFromResponseOutputItem({
+                type: 'message',
+                id: 'msg_upstream',
+                role: 'assistant',
+                status: 'completed',
+                content: [
+                    { type: 'output_text', text: 'hello ', annotations: [] },
+                    { type: 'refusal', refusal: 'world' },
+                ],
+            }),
+        ).toEqual({
+            type: 'message',
+            role: 'assistant',
+            id: 'msg_upstream',
+            status: 'completed',
+            content: [{ type: 'output_text', text: 'hello world', annotations: [] }],
+        });
+
+        expect(
+            createReplayInputItemFromResponseOutputItem({
+                type: 'function_call',
+                id: 'fc_1',
+                call_id: 'call_1',
+                name: 'read_file',
+                arguments: '{"path":"README.md"}',
+            }),
+        ).toEqual({
+            type: 'function_call',
+            id: 'fc_1',
+            call_id: 'call_1',
+            name: 'read_file',
+            arguments: '{"path":"README.md"}',
+        });
+
+        expect(
+            createReplayInputItemFromResponseOutputItem({
+                type: 'web_search_call',
+                id: 'ws_1',
+                status: 'completed',
+                action: { type: 'search', query: 'latest docs' },
+            }),
+        ).toBeUndefined();
+    });
+
     test('maps raw Responses events to internal text events', async () => {
         const events = await collectAsync(
             processCodexStream(
@@ -876,7 +922,7 @@ describe('Codex transport', () => {
                 ...firstBody.input,
                 {
                     type: 'message',
-                    id: 'msg_ws',
+                    id: 'msg_ccx_replay_1_0',
                     role: 'assistant',
                     status: 'completed',
                     content: [{ type: 'output_text', text: 'Hello from WebSocket', annotations: [] }],
